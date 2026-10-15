@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang='en'>
+<head>
+<meta charset='utf-8'>
+<meta name='viewport' content='width=device-width,initial-scale=1'>
+<title>XR1710G Upload Failed</title>
+<style>
+:root{
+  color-scheme:light;
+  --brand-600:#2563eb; --brand-700:#1d4ed8;
+  --red-50:#fef3f2; --red-200:#fecdca; --red-600:#d92d20; --red-700:#b42318;
+  --gray-50:#f9fafb; --gray-100:#f2f4f7; --gray-200:#e4e7ec; --gray-300:#d0d5dd;
+  --gray-400:#98a2b3; --gray-500:#667085; --gray-600:#475467; --gray-700:#344054;
+  --gray-900:#101828;
+  --surface:#fff;
+  --text:var(--gray-900); --text-2:var(--gray-600); --text-3:var(--gray-500);
+  --r-sm:8px; --r:10px; --r-lg:14px; --r-full:999px;
+  --fs-xs:12px; --fs-sm:13px; --fs-base:15px; --fs-md:16px; --fs-lg:18px; --fs-xl:22px;
+  --ease:.2s cubic-bezier(.4,0,.2,1);
+  --font:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+  --shadow:0 1px 2px rgba(16,24,40,.04), 0 12px 28px -12px rgba(16,24,40,.14);
+}
+*,*::before,*::after{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{
+  margin:0;min-height:100svh;padding:20px 16px 32px;
+  display:flex;align-items:flex-start;justify-content:center;
+  background:var(--gray-100);color:var(--text);
+  font:var(--fs-base)/1.6 var(--font);
+  -webkit-font-smoothing:antialiased;
+}
+h1{margin:0}
+:focus-visible{outline:2px solid var(--brand-600);outline-offset:2px;border-radius:4px}
+.panel{
+  width:100%;max-width:560px;
+  background:var(--surface);
+  border:1px solid var(--gray-200);
+  border-radius:var(--r-lg);
+  box-shadow:var(--shadow);
+  overflow:hidden;
+  animation:rise .3s ease both;
+}
+.head{
+  display:flex;align-items:center;gap:14px;
+  padding:20px;
+  background:var(--red-50);
+  border-bottom:1px solid var(--red-200);
+}
+.mark{
+  width:38px;height:38px;flex:0 0 38px;
+  display:grid;place-items:center;
+  border-radius:var(--r-full);
+  background:var(--red-600);color:#fff;
+}
+.mark svg{width:20px;height:20px}
+.head h1{font-size:var(--fs-lg);font-weight:700;letter-spacing:-.01em}
+.head p{margin:2px 0 0;font-size:var(--fs-xs);font-weight:600;color:var(--red-700)}
+.content{padding:20px}
+.content>p{margin:0;color:var(--text-2);font-size:var(--fs-sm);line-height:1.7}
+ul{margin:16px 0 24px;padding-left:18px;color:var(--text-2);font-size:var(--fs-sm);line-height:1.85}
+a{
+  display:inline-flex;align-items:center;justify-content:center;
+  min-height:44px;padding:0 18px;
+  border:1px solid transparent;border-radius:var(--r);
+  background:var(--brand-600);color:#fff;
+  font-size:var(--fs-base);font-weight:600;text-decoration:none;
+  box-shadow:0 1px 2px rgba(16,24,40,.06);
+  transition:background var(--ease),transform var(--ease);
+}
+a:hover{background:var(--brand-700)}
+a:active{transform:scale(.98)}
+@media (min-width:600px){
+  :root{--fs-base:16px;--fs-lg:20px}
+  body{padding:40px 24px}
+  .head{padding:24px 28px}
+  .content{padding:24px 28px 28px}
+}
+@keyframes rise{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+@media (prefers-reduced-motion:reduce){
+  *,*::before,*::after{animation:none!important;transition:none!important}
+}
+</style>
+</head>
+<body>
+  <main class='panel'>
+    <header class='head'>
+      <span class='mark' aria-hidden='true'>
+        <svg viewBox='0 0 20 20' fill='none' stroke='currentColor' stroke-width='1.8' stroke-linecap='round'><path d='M10 5.5v5'/><circle cx='10' cy='14.4' r='1' fill='currentColor' stroke='none'/></svg>
+      </span>
+      <div>
+        <h1>Upload Failed</h1>
+        <p>No erase or write operation was started</p>
+      </div>
+    </header>
+    <section class='content'>
+      <p>The recovery server could not accept this image. Check the selected target and file, then try again.</p>
+      <ul>
+        <li>Firmware images must be at least 1 MiB.</li>
+        <li>U-Boot images must not exceed 1 MiB.</li>
+        <li>Only one recovery task can run at a time.</li>
+      </ul>
+      <a href='/index.html'>Return to Recovery</a>
+    </section>
+  </main>
+</body>
+</html>

@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+set -eu
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+UBOOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+PREFIX_SHIM="$SCRIPT_DIR/chainloader-prefix-shim.uImage"
+SHIM="$SCRIPT_DIR/chainloader-shim.bin"
+# Each board ships its own control DTB and ITS template; pass the board name as
+# the 5th argument.  This repository is primarily XR1710G, so that is the
+# default (XG2010G-http-uboot already validated the same wrapper with its own
+# xg2010g-chainloader-control.dtb / .its.in).
+BOARD="${5:-xr1710g}"
+DTB="$SCRIPT_DIR/$BOARD-chainloader-control.dtb"
+TEMPLATE="$SCRIPT_DIR/$BOARD-chainloader.its.in"
+
+PAYLOAD="$(realpath "${1:-$UBOOT_DIR/u-boot.bin}")"
+OUTPUT_DIR="$(realpath -m "${2:-$UBOOT_DIR/out}")"
+MKIMAGE="${3:-$UBOOT_DIR/tools/mkimage}"
+DUMPIMAGE="${4:-$UBOOT_DIR/tools/dumpimage}"
+
+if [ ! -f "$PAYLOAD" ]; then
+    echo "Error: payload not found: $PAYLOAD" >&2
+    exit 1
+fi
+
+if [ ! -f "$MKIMAGE" ]; then
+    echo "Error: mkimage not found: $MKIMAGE" >&2
+    exit 1
+fi
+
+if [ ! -f "$DTB" ]; then
+    echo "Error: control DTB not found for board '$BOARD': $DTB" >&2
+    exit 1
+fi
+
+if [ ! -f "$TEMPLATE" ]; then
+    echo "Error: ITS template not found for board '$BOARD': $TEMPLATE" >&2
+    exit 1
+fi
+
+mkdir -p "$OUTPUT_DIR"
+
+# Keep all artifacts in one stable directory while making each build easy to
+# identify.  XG2010G_BUILD_STAMP can be supplied by CI for reproducibility.
+BUILD_STAMP="${XG2010G_BUILD_STAMP:-$(date +%Y%m%d-%H%M%S)}"
+EXPECTED_COMMIT="$(git -C "$UBOOT_DIR" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
+PAYLOAD_VERSION="$(strings "$PAYLOAD" 2>/dev/null | sed -n 's/.*U-Boot \(XG2010G-recovery-[^ ]*\).*/\1/p' | head -1 || true)"
+if [ -n "$PAYLOAD_VERSION" ] && [ "$EXPECTED_COMMIT" != "unknown" ] &&
+   [[ "$PAYLOAD_VERSION" != *"-g${EXPECTED_COMMIT}"* ]]; then
+  echo "Error: payload version '$PAYLOAD_VERSION' does not match HEAD '$EXPECTED_COMMIT'. Rebuild U-Boot before packaging." >&2
+  exit 1
+fi
+COMMIT_ID="${XG2010G_COMMIT_ID:-$EXPECTED_COMMIT}"
+OUTPUT_PREFIX="$BOARD-chainloader-${BUILD_STAMP}-g${COMMIT_ID}"
+OUTPUT_FIT="$OUTPUT_DIR/${OUTPUT_PREFIX}.itb"
+OUTPUT_SLOT="$OUTPUT_DIR/${OUTPUT_PREFIX}-slot.bin"
+OUTPUT_PAYLOAD="$OUTPUT_DIR/${BOARD}-u-boot-${BUILD_STAMP}-g${COMMIT_ID}.bin"
+LATEST_FIT="$OUTPUT_DIR/$BOARD-chainloader.itb"
+# The flashable artifact is published as <board>-chainloader-slot.bin; the bare
+# FIT (<board>-chainloader.itb) is for RAM-only TFTP validation and must never
+# be uploaded through HTTP Recovery.
+LATEST_SLOT="$OUTPUT_DIR/$BOARD-chainloader-slot.bin"
+MAX_SLOT_SIZE=$((0x100000))
+
+TMPDIR=$(mktemp -d)
+trap 'rm -rf "$TMPDIR"' EXIT
+
+ITS="$TMPDIR/$BOARD-chainloader.its"
+
+sed \
+  -e "s|__DTB__|$DTB|g" \
+  -e "s|__SHIM__|$SHIM|g" \
+  -e "s|__PAYLOAD__|$PAYLOAD|g" \
+  -e "s|__KCOMP__|none|g" \
+  "$TEMPLATE" > "$ITS"
+
+echo "Building FIT image..."
+"$MKIMAGE" -f "$ITS" "$OUTPUT_FIT"
+"$DUMPIMAGE" -l "$OUTPUT_FIT"
+
+echo "Building slot image..."
+prefix_size=$(wc -c < "$PREFIX_SHIM")
+cp "$PREFIX_SHIM" "$OUTPUT_SLOT"
+dd if=/dev/zero bs=1 count=$((0x2100 - prefix_size)) >> "$OUTPUT_SLOT" 2>/dev/null
+cat "$OUTPUT_FIT" >> "$OUTPUT_SLOT"
+
+# Stable aliases are retained for existing tooling; the timestamped files
+# above are the canonical artifacts to archive or flash.
+cp "$PAYLOAD" "$OUTPUT_PAYLOAD"
+cp "$OUTPUT_FIT" "$LATEST_FIT"
+cp "$OUTPUT_SLOT" "$LATEST_SLOT"
+
+slot_size=$(wc -c < "$OUTPUT_SLOT")
+if [ "$slot_size" -ge "$MAX_SLOT_SIZE" ]; then
+  echo "Error: chainloader slot is not smaller than 1 MiB: $slot_size bytes" >&2
+  exit 1
+fi
+echo ""
+echo "Done!"
+echo "  FIT:  $OUTPUT_FIT ($(wc -c < "$OUTPUT_FIT") bytes)"
+echo "  Slot: $OUTPUT_SLOT ($slot_size bytes; maximum $((MAX_SLOT_SIZE - 1)) bytes)"
+echo "  U-Boot payload: $OUTPUT_PAYLOAD ($(wc -c < "$OUTPUT_PAYLOAD") bytes)"
+echo "  Latest aliases: $LATEST_FIT, $LATEST_SLOT"
+echo ""
+echo "Magic check:"
+echo "  Offset 0x0000: $(dd if="$OUTPUT_SLOT" bs=1 count=4 2>/dev/null | od -A n -t x1 | tr -d ' \n')"
+echo "  Offset 0x2100: $(dd if="$OUTPUT_SLOT" bs=1 skip=$((0x2100)) count=4 2>/dev/null | od -A n -t x1 | tr -d ' \n')"

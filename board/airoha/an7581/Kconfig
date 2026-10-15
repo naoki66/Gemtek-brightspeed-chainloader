@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: GPL-2.0+
+
+if TARGET_AN7581
+
+config BOARD_XR1710G
+	bool "Gemtek XR1710G board support"
+	default y if DEFAULT_DEVICE_TREE="airoha/xr1710g"
+
+config BOARD_XG2010G
+	bool "Gemtek XG2010G board support"
+	default y if DEFAULT_DEVICE_TREE="airoha/xg2010g"
+
+endif

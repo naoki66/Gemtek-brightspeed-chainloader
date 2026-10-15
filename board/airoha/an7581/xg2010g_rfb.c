@@ -1,0 +1,904 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Author: Christian Marangi <ansuelsmth@gmail.com>
+ */
+
+#include <asm/gpio.h>
+#include <asm/global_data.h>
+#include <asm/io.h>
+#include <dt-bindings/gpio/gpio.h>
+#include <dm/device.h>
+#include <dm/ofnode.h>
+#include <env.h>
+#include <fdt_support.h>
+#include <mtd.h>
+#include <net-common.h>
+#include <ubi_uboot.h>
+#undef crc32
+#include <u-boot/crc.h>
+#include <xg2010g_version.h>
+#include <linux/bitops.h>
+#include <linux/err.h>
+#include <linux/kconfig.h>
+#include <linux/string.h>
+
+DECLARE_GLOBAL_DATA_PTR;
+
+#define XG2010G_CHIP_SCU_BASE		0x1fa20000
+#define XG2010G_GPIO_SYSCTL_BASE	0x1fbf0200
+
+#define XG2010G_REG_GPIO_CTRL		0x0000
+#define XG2010G_REG_GPIO_DATA		0x0004
+#define XG2010G_REG_GPIO_OE		0x0014
+#define XG2010G_REG_GPIO_CTRL1		0x0020
+#define XG2010G_REG_GPIO_FLASH_MODE_CFG	0x0034
+#define XG2010G_REG_GPIO_CTRL2		0x0060
+#define XG2010G_REG_GPIO_CTRL3		0x0064
+#define XG2010G_REG_GPIO_DATA1		0x0070
+#define XG2010G_REG_GPIO_OE1		0x0078
+
+#define XG2010G_DSD_PART		"dsd"
+#define XG2010G_UENV_PART		"uenv"
+#define XG2010G_UENV_SIZE		0x4000
+#define XG2010G_UENV_ERASE_SIZE	0x40000
+#define XG2010G_UENV_DATA_SIZE		(XG2010G_UENV_SIZE - sizeof(u32))
+#define XG2010G_UBI_PART		"system"
+#define XG2010G_FACTORY_VOL		"factory"
+#define XG2010G_DSD_ENV_SIZE		0x1000
+/* Mirror the whole 2 MiB "dsd" MTD partition into the "factory" UBI volume
+ * (OOB-stripped), so the kernel nvmem offsets -- pon_serial @0xd2, pon_mac
+ * @0x6c, lan_mac @0x86, pon_calibration @0x12000, ... -- line up with the
+ * stock DSD dump.  Size taken from the DTS: dsd reg = <0x00400000 0x00200000>. */
+#define XG2010G_DSD_SIZE		0x200000
+/* Compare/read granularity for the factory sync.  Kept small so the routine
+ * only needs one 2 MiB source buffer plus a tiny scratch buffer. */
+#define XG2010G_FACTORY_CHUNK		0x10000
+
+struct xg2010g_ubi_layout {
+	const char *version;
+	const char *part;
+};
+
+static const struct xg2010g_ubi_layout xg2010g_ubi_layouts[] = {
+	{ "2.0", XG2010G_UBI_PART },
+};
+
+static const struct xg2010g_ubi_layout *xg2010g_active_ubi_layout =
+	&xg2010g_ubi_layouts[0];
+static bool xg2010g_ubi_layout_probed;
+static bool xg2010g_ubi_layout_available;
+
+static const char *const xg2010g_fdt_lan_mac_paths[] = {
+	"/soc/ethernet@1fb50000/ethernet@1",
+	"/soc/ethernet@1fb50000/ethernet@4",
+};
+
+static const char *const xg2010g_fdt_wan_mac_paths[] = {
+	"/soc/ethernet@1fb50000/ethernet@2",
+};
+
+static bool xg2010g_is_compatible(void)
+{
+	return of_machine_is_compatible("econet,xg2010g") ||
+	       of_machine_is_compatible("econet,xg2010g-ubi") ||
+	       of_machine_is_compatible("gemtek,xg2010g") ||
+	       of_machine_is_compatible("gemtek,xg2010g-ubi");
+}
+
+const char *an7581_release_version(void)
+{
+	return XG2010G_RELEASE_VERSION;
+}
+
+const char *an7581_release_credit(void)
+{
+	return XG2010G_RELEASE_CREDIT;
+}
+
+static void xg2010g_clrsetbits_le32(uintptr_t addr, u32 clear, u32 set)
+{
+	u32 val = readl((void __iomem *)addr);
+
+	val &= ~clear;
+	val |= set;
+	writel(val, (void __iomem *)addr);
+}
+
+static uintptr_t xg2010g_gpio_data_reg(u32 gpio)
+{
+	return XG2010G_GPIO_SYSCTL_BASE +
+	       (gpio < 32 ? XG2010G_REG_GPIO_DATA : XG2010G_REG_GPIO_DATA1);
+}
+
+static uintptr_t xg2010g_gpio_oe_reg(u32 gpio)
+{
+	return XG2010G_GPIO_SYSCTL_BASE +
+	       (gpio < 32 ? XG2010G_REG_GPIO_OE : XG2010G_REG_GPIO_OE1);
+}
+
+static uintptr_t xg2010g_gpio_dir_reg(u32 gpio)
+{
+	static const u16 dir_regs[] = {
+		XG2010G_REG_GPIO_CTRL,
+		XG2010G_REG_GPIO_CTRL1,
+		XG2010G_REG_GPIO_CTRL2,
+		XG2010G_REG_GPIO_CTRL3,
+	};
+
+	return XG2010G_GPIO_SYSCTL_BASE + dir_regs[gpio / 16];
+}
+
+static void xg2010g_gpio_direction_input(u32 gpio)
+{
+	u32 bank_bit = BIT(gpio % 32);
+	u32 dir_bit = BIT(2 * (gpio % 16));
+
+	xg2010g_clrsetbits_le32(xg2010g_gpio_oe_reg(gpio), bank_bit, 0);
+	xg2010g_clrsetbits_le32(xg2010g_gpio_dir_reg(gpio), dir_bit, 0);
+}
+
+static void xg2010g_gpio_prepare_input(u32 gpio)
+{
+	/*
+	 * GPIO0..GPIO15 share the flash/PWM mux register. Clear the bit to
+	 * force the pin back to GPIO before sampling the button.
+	 */
+	if (gpio < 16)
+		xg2010g_clrsetbits_le32(XG2010G_CHIP_SCU_BASE +
+					XG2010G_REG_GPIO_FLASH_MODE_CFG,
+					BIT(gpio), 0);
+
+	xg2010g_gpio_direction_input(gpio);
+}
+
+static int xg2010g_recovery_button_pressed_raw(ofnode root)
+{
+	struct ofnode_phandle_args args;
+	u32 gpio, gpio_flags = 0, val;
+	int ret;
+
+	ret = ofnode_parse_phandle_with_args(root, "recovery-gpios",
+					     "#gpio-cells", 0, 0, &args);
+	if (ret || args.args_count < 1)
+		return 0;
+
+	gpio = args.args[0];
+	if (args.args_count > 1)
+		gpio_flags = args.args[1];
+
+	xg2010g_gpio_prepare_input(gpio);
+
+	val = readl((void __iomem *)xg2010g_gpio_data_reg(gpio));
+	ret = !!(val & BIT(gpio % 32));
+
+	return gpio_flags & GPIO_ACTIVE_LOW ? !ret : ret;
+}
+
+static int xg2010g_read_dsd_data(size_t offset, size_t size, void *buf)
+{
+	struct mtd_info *mtd;
+	size_t retlen = 0;
+	int ret;
+
+	mtd_probe_devices();
+	mtd = get_mtd_device_nm(XG2010G_DSD_PART);
+	if (IS_ERR_OR_NULL(mtd))
+		return IS_ERR(mtd) ? PTR_ERR(mtd) : -ENODEV;
+
+	ret = mtd_read(mtd, offset, size, &retlen, buf);
+	put_mtd_device(mtd);
+	if (ret)
+		return ret;
+	if (retlen != size)
+		return -EIO;
+
+	return 0;
+}
+
+static bool xg2010g_uenv_is_recovery_trigger(const char *entry, size_t len)
+{
+	static const char name[] = "recovery_trigger=";
+
+	return len == sizeof(name) && !memcmp(entry, name, sizeof(name) - 1) &&
+	       entry[sizeof(name) - 1] == '1';
+}
+
+static int xg2010g_uenv_write_block(struct mtd_info *mtd, const u8 *buf)
+{
+	struct erase_info erase = {
+		.mtd = mtd,
+		.addr = 0,
+		.len = XG2010G_UENV_ERASE_SIZE,
+	};
+	size_t offset = 0;
+	int ret;
+
+	ret = mtd_erase(mtd, &erase);
+	if (ret)
+		return ret;
+
+	while (offset < XG2010G_UENV_ERASE_SIZE) {
+		size_t retlen = 0;
+		size_t len = min_t(size_t, mtd->writesize,
+				   XG2010G_UENV_ERASE_SIZE - offset);
+
+		ret = mtd_write(mtd, offset, len, &retlen, buf + offset);
+		if (ret)
+			return ret;
+		if (retlen != len)
+			return -EIO;
+
+		offset += len;
+	}
+
+	return 0;
+}
+
+/* Consume the chainloader-private one-shot flag from the U-Boot environment. */
+static int xg2010g_uenv_consume_recovery_trigger(bool *triggered)
+{
+	struct mtd_info *mtd;
+	u8 *block = NULL, *verify = NULL;
+	u8 *data, *src, *dst, *end;
+	u32 stored_crc, calculated_crc;
+	size_t retlen = 0;
+	int ret = 0;
+
+	*triggered = false;
+	mtd_probe_devices();
+	mtd = get_mtd_device_nm(XG2010G_UENV_PART);
+	if (IS_ERR_OR_NULL(mtd))
+		return IS_ERR(mtd) ? PTR_ERR(mtd) : -ENODEV;
+
+	if (mtd->size < XG2010G_UENV_ERASE_SIZE ||
+	    !mtd->writesize || XG2010G_UENV_ERASE_SIZE % mtd->writesize) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	block = malloc(XG2010G_UENV_ERASE_SIZE);
+	verify = malloc(XG2010G_UENV_SIZE);
+	if (!block || !verify) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	ret = mtd_read(mtd, 0, XG2010G_UENV_ERASE_SIZE, &retlen, block);
+	if ((ret && ret != -EUCLEAN) || retlen != XG2010G_UENV_ERASE_SIZE) {
+		if (!ret)
+			ret = -EIO;
+		goto out;
+	}
+	ret = 0;
+
+	memcpy(&stored_crc, block, sizeof(stored_crc));
+	data = block + sizeof(stored_crc);
+	calculated_crc = crc32(0, data, XG2010G_UENV_DATA_SIZE);
+	if (stored_crc != calculated_crc) {
+		ret = -EBADMSG;
+		goto out;
+	}
+
+	src = data;
+	dst = data;
+	end = data + XG2010G_UENV_DATA_SIZE;
+	while (src < end && *src) {
+		size_t len = strnlen((char *)src, end - src);
+
+		if (src + len == end) {
+			ret = -EINVAL;
+			goto out;
+		}
+
+		if (xg2010g_uenv_is_recovery_trigger((char *)src, len)) {
+			*triggered = true;
+		} else {
+			memmove(dst, src, len + 1);
+			dst += len + 1;
+		}
+
+		src += len + 1;
+	}
+
+	if (!*triggered)
+		goto out;
+
+	memset(dst, 0, end - dst);
+	calculated_crc = crc32(0, data, XG2010G_UENV_DATA_SIZE);
+	memcpy(block, &calculated_crc, sizeof(calculated_crc));
+
+	ret = xg2010g_uenv_write_block(mtd, block);
+	if (ret)
+		goto out;
+
+	retlen = 0;
+	ret = mtd_read(mtd, 0, XG2010G_UENV_SIZE, &retlen, verify);
+	if ((ret && ret != -EUCLEAN) || retlen != XG2010G_UENV_SIZE) {
+		if (!ret)
+			ret = -EIO;
+		goto out;
+	}
+	ret = 0;
+	if (memcmp(verify, block, XG2010G_UENV_SIZE))
+		ret = -EIO;
+
+out:
+	if (ret)
+		*triggered = false;
+	free(block);
+	free(verify);
+	put_mtd_device(mtd);
+
+	return ret;
+}
+
+static int xg2010g_dsd_get_var(const char *buf, size_t len, const char *key,
+				 char *value, size_t value_len)
+{
+	size_t key_len = strlen(key);
+	const char *cur = buf;
+	const char *end = buf + len;
+
+	if (!value_len)
+		return -EINVAL;
+
+	while (cur < end) {
+		const char *line_end = memchr(cur, '\n', end - cur);
+		size_t line_len, copy_len;
+
+		if (!line_end)
+			line_end = end;
+
+		line_len = line_end - cur;
+		if (line_len > key_len && !memcmp(cur, key, key_len)) {
+			copy_len = line_len - key_len;
+			if (copy_len >= value_len)
+				copy_len = value_len - 1;
+
+			memcpy(value, cur + key_len, copy_len);
+			value[copy_len] = '\0';
+
+			while (copy_len && value[copy_len - 1] == '\r')
+				value[--copy_len] = '\0';
+
+			return 0;
+		}
+
+		if (line_end == end)
+			break;
+		cur = line_end + 1;
+	}
+
+	return -ENOENT;
+}
+
+static int xg2010g_get_dsd_ethaddrs(u8 *lan_mac, u8 *wan_mac)
+{
+	char *buf;
+	char lan_str[ARP_HLEN_ASCII + 1];
+	char wan_str[ARP_HLEN_ASCII + 1];
+	int ret;
+
+	buf = malloc(XG2010G_DSD_ENV_SIZE + 1);
+	if (!buf)
+		return -ENOMEM;
+
+	ret = xg2010g_read_dsd_data(0, XG2010G_DSD_ENV_SIZE, buf);
+	if (ret)
+		goto out;
+
+	buf[XG2010G_DSD_ENV_SIZE] = '\0';
+
+	ret = xg2010g_dsd_get_var(buf, XG2010G_DSD_ENV_SIZE, "lan_mac=",
+				  lan_str, sizeof(lan_str));
+	if (ret)
+		goto out;
+
+	ret = xg2010g_dsd_get_var(buf, XG2010G_DSD_ENV_SIZE, "wan_mac=",
+				  wan_str, sizeof(wan_str));
+	if (ret)
+		goto out;
+
+	string_to_enetaddr(lan_str, lan_mac);
+	string_to_enetaddr(wan_str, wan_mac);
+	if (!is_valid_ethaddr(lan_mac) || !is_valid_ethaddr(wan_mac)) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	ret = 0;
+
+out:
+	free(buf);
+	return ret;
+}
+
+static int xg2010g_create_ubi_volume(const char *name, size_t size)
+{
+	struct ubi_mkvol_req req;
+	struct ubi_device *ubi;
+	int ret;
+
+	if (!name || !*name)
+		return -EINVAL;
+
+	ubi = ubi_get_device(0);
+	if (!ubi)
+		return -ENODEV;
+
+	memset(&req, 0, sizeof(req));
+	req.vol_id = UBI_VOL_NUM_AUTO;
+	req.alignment = 1;
+	req.bytes = size;
+	req.vol_type = UBI_STATIC_VOLUME;
+	req.name_len = strlen(name);
+	if (req.name_len > UBI_VOL_NAME_MAX) {
+		ubi_put_device(ubi);
+		return -ENAMETOOLONG;
+	}
+	memcpy(req.name, name, req.name_len);
+	req.name[req.name_len] = '\0';
+
+	mutex_lock(&ubi->device_mutex);
+	ret = ubi_create_volume(ubi, &req);
+	mutex_unlock(&ubi->device_mutex);
+	ubi_put_device(ubi);
+
+	return ret;
+}
+
+static int xg2010g_resize_ubi_volume(const char *name, size_t size)
+{
+	struct ubi_volume_desc *desc;
+	struct ubi_volume *vol;
+	int ret, needed_pebs;
+
+	if (!name || !*name)
+		return -EINVAL;
+
+	desc = ubi_open_volume_nm(0, name, UBI_EXCLUSIVE);
+	if (IS_ERR_OR_NULL(desc))
+		return IS_ERR(desc) ? PTR_ERR(desc) : -ENODEV;
+
+	vol = desc->vol;
+	needed_pebs = DIV_ROUND_UP(size, vol->usable_leb_size);
+
+	mutex_lock(&vol->ubi->device_mutex);
+	ret = ubi_resize_volume(desc, needed_pebs);
+	mutex_unlock(&vol->ubi->device_mutex);
+	ubi_close_volume(desc);
+
+	return ret;
+}
+
+static int xg2010g_ensure_ubi_volume(const char *name, size_t size)
+{
+	struct ubi_volume_desc *desc;
+	unsigned long long cur_size;
+	int ret;
+
+	if (!name || !*name)
+		return -EINVAL;
+
+	desc = ubi_open_volume_nm(0, name, UBI_READWRITE);
+	if (IS_ERR_OR_NULL(desc)) {
+		ret = xg2010g_create_ubi_volume(name, size);
+		if (!ret)
+			return 0;
+		return ret;
+	}
+
+	cur_size = (unsigned long long)desc->vol->reserved_pebs *
+		   (unsigned long long)desc->vol->usable_leb_size;
+	ubi_close_volume(desc);
+
+	if (size <= cur_size)
+		return 0;
+
+	return xg2010g_resize_ubi_volume(name, size);
+}
+
+static const struct xg2010g_ubi_layout *
+xg2010g_find_ubi_layout(const char *part)
+{
+	int i;
+
+	if (!part)
+		return NULL;
+
+	for (i = 0; i < ARRAY_SIZE(xg2010g_ubi_layouts); i++) {
+		if (!strcmp(part, xg2010g_ubi_layouts[i].part))
+			return &xg2010g_ubi_layouts[i];
+	}
+
+	return NULL;
+}
+
+static int xg2010g_select_ubi(const char *part)
+{
+	struct ubi_device *ubi;
+	bool selected = false;
+
+	if (!xg2010g_find_ubi_layout(part))
+		return -EINVAL;
+
+	ubi = ubi_get_device(0);
+	if (ubi) {
+		selected = ubi->mtd && !strcmp(ubi->mtd->name, part);
+		ubi_put_device(ubi);
+	}
+
+	return selected ? 0 : ubi_part(part, NULL);
+}
+
+const char *xg2010g_detect_ubi_part(void)
+{
+	if (xg2010g_ubi_layout_probed)
+		return xg2010g_active_ubi_layout->part;
+
+	/*
+	 * The vendor kernel exposes the persistent partition as "system"; there are
+	 * no legacy 1.5/1.0 views to probe.
+	 */
+	xg2010g_ubi_layout_probed = true;
+	xg2010g_ubi_layout_available = true;
+	xg2010g_active_ubi_layout = &xg2010g_ubi_layouts[0];
+	printf("XG2010G: detected UBI %s on '%s'\n",
+	       xg2010g_active_ubi_layout->version,
+	       xg2010g_active_ubi_layout->part);
+
+	return xg2010g_active_ubi_layout->part;
+}
+
+const char *xg2010g_detect_ubi_version(void)
+{
+	xg2010g_detect_ubi_part();
+	return xg2010g_ubi_layout_available ?
+		xg2010g_active_ubi_layout->version : "unformatted";
+}
+
+const char *env_ubi_get_part(void)
+{
+	return xg2010g_detect_ubi_part();
+}
+
+int xg2010g_sync_factory_part(const char *part)
+{
+	u8 *src = NULL, *tmp = NULL;
+	size_t done, chunk;
+	bool dirty = false;
+	int ret = 0;
+
+	if (!xg2010g_is_compatible())
+		return 0;
+
+	ret = xg2010g_select_ubi(part);
+	if (ret) {
+		printf("XG2010G: skipping factory sync; UBI is unavailable: %d\n",
+		       ret);
+		return ret;
+	}
+
+	/*
+	 * Mirror the entire 2 MiB "dsd" MTD partition into the "factory" UBI
+	 * volume.  The kernel nvmem layout (pon_serial @0xd2, pon_mac @0x6c,
+	 * lan_mac @0x86, pon_calibration @0x12000, ...) expects the factory
+	 * volume to be a byte-for-byte copy of the DSD data area, so we copy
+	 * the whole partition instead of repacking only the two MAC addresses.
+	 * A single 2 MiB source buffer is used; the existing volume is compared
+	 * in small chunks so we only rewrite when the DSD actually changed.
+	 */
+	src = malloc(XG2010G_DSD_SIZE);
+	tmp = malloc(XG2010G_FACTORY_CHUNK);
+	if (!src || !tmp) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	ret = xg2010g_read_dsd_data(0, XG2010G_DSD_SIZE, src);
+	if (ret) {
+		printf("XG2010G: failed to read DSD partition: %d\n", ret);
+		goto out;
+	}
+
+	for (done = 0; done < XG2010G_DSD_SIZE; done += chunk) {
+		chunk = min_t(size_t, XG2010G_FACTORY_CHUNK,
+			      XG2010G_DSD_SIZE - done);
+
+		memset(tmp, 0, XG2010G_FACTORY_CHUNK);
+		ret = ubi_volume_read(XG2010G_FACTORY_VOL, tmp, done, chunk);
+		if (ret || memcmp(src + done, tmp, chunk)) {
+			dirty = true;
+			break;
+		}
+	}
+
+	if (!dirty)
+		goto out;
+
+	ret = xg2010g_ensure_ubi_volume(XG2010G_FACTORY_VOL,
+					XG2010G_DSD_SIZE);
+	if (ret) {
+		printf("XG2010G: failed to prepare UBI volume '%s': %d\n",
+		       XG2010G_FACTORY_VOL, ret);
+		goto out;
+	}
+
+	ret = ubi_volume_write(XG2010G_FACTORY_VOL, src, 0, XG2010G_DSD_SIZE);
+	if (ret) {
+		printf("XG2010G: failed to update UBI volume '%s': %d\n",
+		       XG2010G_FACTORY_VOL, ret);
+		goto out;
+	}
+
+	printf("XG2010G: synchronized %u bytes of DSD factory data to '%s'\n",
+	       XG2010G_DSD_SIZE, XG2010G_FACTORY_VOL);
+
+out:
+	free(src);
+	free(tmp);
+	return ret;
+}
+
+int xg2010g_sync_factory(void)
+{
+	const char *part = xg2010g_detect_ubi_part();
+
+	if (!xg2010g_ubi_layout_available)
+		return -ENODEV;
+
+	return xg2010g_sync_factory_part(part);
+}
+
+static void xg2010g_mac_add(const u8 *base, u8 delta, u8 *mac)
+{
+	int i;
+	unsigned int carry = delta;
+
+	memcpy(mac, base, ARP_HLEN);
+	for (i = ARP_HLEN - 1; i >= 0 && carry; i--) {
+		carry += mac[i];
+		mac[i] = carry & 0xff;
+		carry >>= 8;
+	}
+}
+
+static int xg2010g_get_runtime_ethaddrs(u8 *lan_mac, u8 *wan_mac)
+{
+	int ret;
+
+	ret = xg2010g_get_dsd_ethaddrs(lan_mac, wan_mac);
+	if (!ret)
+		return 0;
+
+	if (!eth_env_get_enetaddr("ethaddr", lan_mac) ||
+	    !is_valid_ethaddr(lan_mac))
+		return ret;
+
+	if (!eth_env_get_enetaddr("eth1addr", wan_mac) ||
+	    !is_valid_ethaddr(wan_mac))
+		xg2010g_mac_add(lan_mac, 4, wan_mac);
+
+	return 0;
+}
+
+static void xg2010g_sync_runtime_ethaddrs(void)
+{
+	u8 lan_mac[ARP_HLEN], wan_mac[ARP_HLEN];
+	int ret;
+
+	if (!xg2010g_is_compatible())
+		return;
+
+	ret = xg2010g_get_dsd_ethaddrs(lan_mac, wan_mac);
+	if (ret) {
+		printf("XG2010G: failed to read runtime MACs from DSD: %d\n",
+		       ret);
+		return;
+	}
+
+	eth_env_set_enetaddr("ethaddr", lan_mac);
+	eth_env_set_enetaddr("eth1addr", wan_mac);
+	printf("XG2010G: MACs from DSD LAN=%pM WAN=%pM\n",
+	       lan_mac, wan_mac);
+}
+
+static int xg2010g_fdt_set_mac(void *blob, const char *path, const u8 *mac)
+{
+	int node, ret;
+
+	node = fdt_path_offset(blob, path);
+	if (node < 0)
+		return node;
+
+	ret = fdt_setprop(blob, node, "mac-address", mac, ARP_HLEN);
+	if (ret)
+		return ret;
+
+	return fdt_setprop(blob, node, "local-mac-address", mac, ARP_HLEN);
+}
+
+static void xg2010g_fixup_fdt_macs(void *blob)
+{
+	u8 lan_mac[ARP_HLEN], wan_mac[ARP_HLEN];
+	int i, ret;
+
+	if (!xg2010g_is_compatible() && !xg2010g_is_compatible())
+		return;
+
+	if (xg2010g_get_runtime_ethaddrs(lan_mac, wan_mac))
+		return;
+
+	for (i = 0; i < ARRAY_SIZE(xg2010g_fdt_lan_mac_paths); i++) {
+		ret = xg2010g_fdt_set_mac(blob, xg2010g_fdt_lan_mac_paths[i],
+					  lan_mac);
+		if (ret && ret != -FDT_ERR_NOTFOUND)
+			printf("XG2010G: failed to update MAC for %s: %d\n",
+			       xg2010g_fdt_lan_mac_paths[i], ret);
+	}
+
+	for (i = 0; i < ARRAY_SIZE(xg2010g_fdt_wan_mac_paths); i++) {
+		ret = xg2010g_fdt_set_mac(blob, xg2010g_fdt_wan_mac_paths[i],
+					  wan_mac);
+		if (ret && ret != -FDT_ERR_NOTFOUND)
+			printf("XG2010G: failed to update MAC for %s: %d\n",
+			       xg2010g_fdt_wan_mac_paths[i], ret);
+	}
+}
+
+int board_init(void)
+{
+	/* address of boot parameters */
+	gd->bd->bi_boot_params = CFG_SYS_SDRAM_BASE + 0x100;
+
+	return 0;
+}
+
+int run_http_recovery(void);
+
+static int xg2010g_recovery_button_pressed(void)
+{
+	struct gpio_desc rec_gpio;
+	ofnode root;
+	int ret;
+
+	if (!xg2010g_is_compatible() && !xg2010g_is_compatible())
+		return 0;
+
+	memset(&rec_gpio, 0, sizeof(rec_gpio));
+	root = ofnode_path("/");
+	ret = gpio_request_by_name_nodev(root, "recovery-gpios", 0, &rec_gpio,
+					 GPIOD_IS_IN);
+	if (ret)
+		return xg2010g_recovery_button_pressed_raw(root);
+
+	ret = dm_gpio_get_value(&rec_gpio);
+	dm_gpio_free(NULL, &rec_gpio);
+
+	return ret > 0;
+}
+
+int board_late_init(void)
+{
+	char boot_ubi[64];
+	const char *ubi_part;
+	const char *bootcmd;
+	ulong recovery_addr;
+	bool uenv_triggered = false;
+
+	printf("XG2010G release %s - %s\n",
+	       XG2010G_RELEASE_VERSION, XG2010G_RELEASE_CREDIT);
+	printf("XG2010G HTTP recovery: type 'http_recovery', then open http://192.168.0.1/ (PC 192.168.0.2/24)\n");
+
+	/* Read only the chainloader-private mtd1/uenv flag; never save mtd0 env. */
+	if (xg2010g_is_compatible()) {
+		int trigger_ret = xg2010g_uenv_consume_recovery_trigger(&uenv_triggered);
+		if (trigger_ret && trigger_ret != -ENODEV && trigger_ret != -EBADMSG)
+			printf("XG2010G: uenv trigger read failed: %d\n", trigger_ret);
+	}
+
+	/* Populate the Ethernet addresses before the network stack is initialized. */
+	/*
+	 * The persistent environment is in mtd1/uenv, but factory MACs are not
+	 * guaranteed to be present there. Read them from dsd before
+	 * eth_initialize() runs, otherwise the Ethernet uclass generates a random
+	 * locally-administered address. This is a small 4 KiB read and is safe
+	 * after initr_nand.
+	 */
+	xg2010g_sync_runtime_ethaddrs();
+	ubi_part = xg2010g_detect_ubi_part();
+	snprintf(boot_ubi, sizeof(boot_ubi),
+		 "ubi part %s && run boot_production", ubi_part);
+	env_set("boot_ubi", boot_ubi);
+	/*
+	 * The persistent environment may come from an older image whose
+	 * bootcmd starts with the removed legacy 'flash' command (for example
+	 * the factory 'flash imgread 2048;bootm' recipe). Once that
+	 * command fails, the rest of the old recipe can try to boot the
+	 * chainloader FIT left at loadaddr instead of the production FIT.
+	 * Normalize only these known legacy recipes; preserve user commands.
+	 */
+	bootcmd = env_get("bootcmd");
+	if (!bootcmd || !strncmp(bootcmd, "flash ", 6) ||
+	    strstr(bootcmd, "http_recovery")) {
+		env_set("bootcmd", "run boot_ubi");
+		printf("XG2010G: normalized legacy bootcmd to direct UBI FIT\n");
+	}
+	/* Older persistent environments may also lack the helper recipes that
+	 * the current boot_ubi command invokes. Restore only missing/legacy
+	 * definitions so the production FIT can be booted without erasing env. */
+	if (!env_get("ubi_read_production"))
+		env_set("ubi_read_production", "ubi read ${loadaddr} fit");
+	bootcmd = env_get("boot_production");
+	if (!bootcmd || !strncmp(bootcmd, "flash ", 6))
+		env_set("boot_production",
+		 "run ubi_read_production && bootm ${loadaddr}#${bootconf}");
+	/* The factory environment carries fdt_high=0xac000000 from the
+	 * vendor boot flow. That fixed ceiling forces the relocated DTB into
+	 * an unsuitable high-memory window on this 64-bit U-Boot. Let the
+	 * normal LMB allocator choose a valid, reserved-safe address instead. */
+	if (env_get("fdt_high")) {
+		env_set("fdt_high", NULL);
+		printf("XG2010G: cleared legacy fdt_high override\n");
+	}
+	/*
+	 * Do not perform large raw NAND/UBI reads from board_late_init.  On this
+	 * board the first-stage loader may leave SNFI/DMA active; large early
+	 * reads can overwrite relocated U-Boot text before eth_initialize().
+	 * Factory synchronisation is deferred to the normal production path.
+	 */
+	/* Only the chainloader-private flag may select HTTP recovery. */
+	if (uenv_triggered) {
+		printf("Factory uenv recovery trigger consumed, starting web recovery...\n");
+	} else if (env_get("recovery_trigger") &&
+	    !strcmp(env_get("recovery_trigger"), "1")) {
+		/* The persistent clear is performed by the MTD environment backend. */
+		env_set("recovery_trigger", "0");
+	} else if (!xg2010g_recovery_button_pressed()) {
+		return 0;
+	} else {
+		printf("Recovery button detected, starting web recovery...\n");
+	}
+
+	env_set("ipaddr", "192.168.0.1");
+	env_set("netmask", "255.255.255.0");
+	env_set("gatewayip", "0.0.0.0");
+	printf("XG2010G recovery network: port=%s rtl8261_patch_autoload=%s\n",
+	       env_get("recovery_port") ? env_get("recovery_port") : "auto",
+	       env_get("rtl8261_patch_autoload") ?
+	       env_get("rtl8261_patch_autoload") : "board-default-on");
+
+	/*
+	 * Keep the recovery upload buffer well away from the low-memory
+	 * boot/load addresses. Large HTTP uploads are staged fully in RAM
+	 * before flashing.
+	 */
+	recovery_addr = gd->ram_base + 0x10000000UL;
+	if ((recovery_addr < gd->ram_base) ||
+	    (recovery_addr >= gd->ram_base + gd->ram_size))
+		recovery_addr = CONFIG_SYS_LOAD_ADDR;
+	env_set_hex("recovery_addr", recovery_addr);
+
+	if (IS_ENABLED(CONFIG_HTTPD_RECOVERY)) {
+		/* Do not fall through into autoboot after Ctrl-C. Re-entering the
+		 * chainloader FIT while Ethernet/QDMA is being torn down can abort. */
+		run_http_recovery();
+		env_set("bootdelay", "-1");
+		printf("Recovery stopped; autoboot disabled (reset to resume normal boot)\n");
+	} else
+		printf("HTTP recovery is not enabled.\n");
+
+	return 0;
+}
+
+#if defined(CONFIG_OF_LIBFDT) && defined(CONFIG_OF_BOARD_SETUP)
+int ft_board_setup(void *blob, struct bd_info *bd)
+{
+	if (!blob)
+		return 0;
+
+	xg2010g_fixup_fdt_macs(blob);
+
+	return 0;
+}
+#endif

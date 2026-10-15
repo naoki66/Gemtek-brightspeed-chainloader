@@ -1,0 +1,155 @@
+// SPDX-License-Identifier: GPL-2.0+
+
+#include "an7581-u-boot.dtsi"
+
+/ {
+	memory@80000000 {
+		device_type = "memory";
+		reg = <0x0 0x80000000 0x0 0x40000000>;
+	};
+
+	soc {
+		pcie_pcs: pcs@1fa04000 {
+			compatible = "airoha,an7581-pcs-pcie";
+			reg = <0x0 0x1fa04000 0x0 0x1000>,
+			      <0x0 0x1fa50000 0x0 0x60>,
+			      <0x0 0x1fa50a00 0x0 0x164>,
+			      <0x0 0x1fa54000 0x0 0x450>,
+			      <0x0 0x1fa55900 0x0 0x338>,
+			      <0x0 0x1fa56000 0x0 0x300>,
+			      <0x0 0x1fa05000 0x0 0x1000>,
+			      <0x0 0x1fa60000 0x0 0x60>,
+			      <0x0 0x1fa60a00 0x0 0x164>,
+			      <0x0 0x1fa64000 0x0 0x450>,
+			      <0x0 0x1fa65900 0x0 0x338>,
+			      <0x0 0x1fa66000 0x0 0x300>,
+			      <0x0 0x1fa5a000 0x0 0x1000>,
+			      <0x0 0x1fa5b000 0x0 0x1000>,
+			      <0x0 0x1fa5c000 0x0 0x1000>;
+			reg-names = "pcs_mac0", "hsgmii_an0", "hsgmii_pcs0",
+				    "multi_sgmii0", "usxgmii0", "hsgmii_rate_adp0",
+				    "pcs_mac1", "hsgmii_an1", "hsgmii_pcs1",
+				    "multi_sgmii1", "usxgmii1", "hsgmii_rate_adp1",
+				    "pcs_ana", "pcs_pma0", "pcs_pma1";
+			status = "okay";
+		};
+
+		usb_pcs: pcs@1fa07000 {
+			compatible = "airoha,an7581-pcs-usb";
+			reg = <0x0 0x1fa07000 0x0 0x1000>,
+			      <0x0 0x1fa90000 0x0 0x64>,
+			      <0x0 0x1fa90a00 0x0 0x168>,
+			      <0x0 0x1fa94000 0x0 0x450>,
+			      <0x0 0x1fa96000 0x0 0x100>,
+			      <0x0 0x1fa9a000 0x0 0x404>;
+			reg-names = "xsi_mac", "hsgmii_an", "hsgmii_pcs",
+				    "multi_sgmii", "hsgmii_rate_adp", "phya";
+
+			resets = <&scuclk EN7581_HSI_RST>,
+				 <&scuclk EN7581_HSI_MAC_RST>;
+			reset-names = "phy", "mac";
+			status = "okay";
+		};
+	};
+
+	mdio-bus {
+		compatible = "airoha,arht-mdio";
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		phy5: ethernet-phy@5 {
+			compatible = "ethernet-phy-ieee802.3-c45";
+			reg = <5>;
+			reset-gpios = <&en7581_pinctrl 29 GPIO_ACTIVE_LOW>;
+			reset-assert-us = <200000>;
+			reset-deassert-us = <200000>;
+			realtek,pnswap-tx;
+			realtek,pnswap-rx;
+		};
+
+		phy8: ethernet-phy@8 {
+			compatible = "ethernet-phy-ieee802.3-c45";
+			reg = <8>;
+			reset-gpios = <&en7581_pinctrl 27 GPIO_ACTIVE_LOW>;
+			reset-assert-us = <200000>;
+			reset-deassert-us = <200000>;
+			realtek,pnswap-tx;
+			realtek,pnswap-rx;
+		};
+
+		phy13: ethernet-phy@13 {
+			reg = <13>;
+		};
+
+		phy14: ethernet-phy@14 {
+			reg = <14>;
+		};
+
+		phy15: ethernet-phy@15 {
+			compatible = "ethernet-phy-ieee802.3-c22";
+			reg = <15>;
+			reset-gpios = <&en7581_pinctrl 31 GPIO_ACTIVE_LOW>;
+			reset-assert-us = <1000000>;
+			reset-deassert-us = <150000>;
+		};
+	};
+};
+
+/* LAN2 uses the RTL8261 on the PCIe1 Multi-SerDes lane. */
+&pcie_pcs {
+	status = "okay";
+};
+
+/* an7581-u-boot.dtsi is applied after the upstream board DTS defaults. */
+&gdm1 {
+	status = "okay";
+};
+
+&eth_pcs {
+	status = "okay";
+};
+
+	&eth {
+	gdm3: ethernet@3 {
+		compatible = "airoha,eth-mac";
+		reg = <3>;
+		status = "okay";
+		phy-mode = "usxgmii";
+		phy-handle = <&phy8>;
+		pcs = <&pcie_pcs 1>;
+		airoha,source-port = <0x17>;
+		airoha,tx-channel = <11>;
+		airoha,nboq = <5>;
+	};
+};
+
+&snfi {
+	status = "okay";
+};
+
+&switch {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <&mdio_pins>;
+	airoha,phy-poll-start = <5>;
+	airoha,phy-poll-end = <15>;
+	/* LAN4 is switch port 4 / internal ePHY12. Include the external
+	 * RTL8261 PHY5/PHY8 in the recovery power-cycle mask too; otherwise
+	 * LAN1/LAN2 can remain in BMCR power-down after eth re-entry. */
+	airoha,recovery-switch-port-mask = <0x10>;
+	airoha,recovery-phy-mask = <0x1120>;
+};
+
+&gdm4 {
+	status = "okay";
+	phy-mode = "usxgmii";
+	phy-handle = <&phy5>;
+	pcs = <&eth_pcs>;
+	airoha,usb-hsgmii;
+	airoha,source-port = <0x18>;
+	airoha,tx-channel = <13>;
+	secondary-pcs = <&usb_pcs>;
+	secondary-phy = <&phy15>;
+	airoha,secondary-source-port = <0x19>;
+	airoha,secondary-tx-channel = <12>;
+};
