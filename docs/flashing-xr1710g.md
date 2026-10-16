@@ -116,8 +116,14 @@ reset
    *After `reset` the chainloader (second-stage U-Boot) starts.*
 2. 按住 reset 键再上电，进入 HTTP 恢复模式。
    *Power-cycle again while holding the reset button to enter HTTP recovery.*
-3. 电脑网卡改为 DHCP（自动获取 192.168.0.2–192.168.0.50），浏览器打开 <http://192.168.0.1>。
-   *Set the PC NIC to DHCP (192.168.0.2–192.168.0.50) and open http://192.168.0.1.*
+3. 电脑网卡设**静态 IP `192.168.0.10 / 255.255.255.0`**（网关留空），浏览器打开 <http://192.168.0.1>。
+   恢复模式的 U-Boot 本身就是固定 `192.168.0.1/24`，静态地址即可直接访问，不必依赖 DHCP。
+   *Set the PC NIC to a static `192.168.0.10 / 255.255.255.0` (no gateway) and open
+   http://192.168.0.1. The recovery U-Boot is itself fixed at 192.168.0.1/24, so a static
+   address works without DHCP.*
+
+   也可以改用 DHCP（自动获取 192.168.0.2–192.168.0.50）；若长时间拿不到地址，参见 FAQ。
+   *DHCP (192.168.0.2–192.168.0.50) also works; see the FAQ if the client never gets an address.*
 4. 上传 OpenWrt 固件 `*-sysupgrade.itb`（选择 `firmware` 目标），等待写入完成。
    *Upload the OpenWrt `*-sysupgrade.itb` (target `firmware`) and wait.*
 5. 日常升级都走 HTTP 恢复，无需再拆机 TTL；更新 chainloader 本身用 `uboot` 目标上传 `xr1710g-chainloader-slot.bin`。
@@ -195,3 +201,35 @@ reset
   *If the vendor firmware provides `env default -a`, run it first to restore its compiled-in defaults,
   then set the `bootcmd` above. This `saveenv` is issued by the *vendor* U-Boot and is the correct
   owner of the partition.*
+
+- **串口出现 `Volume fit not found!` 后进入 HTTP 恢复：** 这是**正常现象**，说明 UBI 里还没有
+  `fit` 卷，即设备上目前没有固件可启动，chainloader 按设计回落到网页恢复。按 3.6 节上传
+  `*-sysupgrade.itb`（`firmware` 目标）即可创建该卷。
+  *`Volume fit not found!` followed by HTTP recovery is expected: the UBI has no `fit` volume, i.e.
+  no firmware is installed, so the chainloader falls back to web recovery by design. Upload the
+  `*-sysupgrade.itb` (target `firmware`) as described in 3.6.*
+
+- **电脑一直拿不到 IP（串口反复打印 `DHCP: DISCOVER` / `DHCP: sent OFFER`）：**
+  服务端已经发出 OFFER，但客户端没收下，属于**链路/端口**问题而不是 DHCP 协议问题。按顺序排查：
+  *The server does send the OFFER but the client never takes it — a link/port problem rather than a
+  DHCP protocol problem. Check in this order:*
+
+  1. **直接改用静态 IP**：把电脑网卡设为 `192.168.0.10 / 255.255.255.0`，打开 <http://192.168.0.1>。
+     恢复模式 U-Boot 固定为 `192.168.0.1/24`，不依赖 DHCP；能打开就说明只是 DHCP 回复没送达。
+     *Use a static PC address — the recovery U-Boot is fixed at 192.168.0.1/24 and does not need DHCP.*
+  2. **换网口**：教程要求插 10GbE 口（`fport 4`），该路径走 GDM4/XSI，另外的 1G/2.5G LAN 口
+     （`fport 1`）走交换机常规路径。两边都试一次。
+     *Try the other port: the 10GbE port (fport 4) uses the GDM4/XSI path, the 1G/2.5G LAN ports
+     (fport 1) the normal switch path.*
+  3. **对齐 `recovery_port`**：只接受指定端口的 DHCP。在 chainloader 提示符下按实际所用网口设置
+     （**只改内存，不要 `saveenv`**）：
+     *Match `recovery_port` to the port you are using — in RAM only, never `saveenv`:*
+
+     ```sh
+     setenv recovery_port 10g     # 或 lan1 / 1g / lan2 / wan
+     setenv ipaddr 192.168.0.1
+     http_recovery
+     ```
+  4. 从 U-Boot 反向验证收发：`ping 192.168.0.10`（先把电脑设成该静态地址）。能通就说明
+     IP/TX/RX 都正常，问题只在 DHCP 回复。
+     *Validate TX/RX from U-Boot with `ping 192.168.0.10`.*

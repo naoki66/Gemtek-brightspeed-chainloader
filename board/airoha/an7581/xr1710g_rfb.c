@@ -914,6 +914,15 @@ int board_late_init(void)
 		printf("Recovery button detected, starting web recovery...\n");
 	}
 
+	/*
+	 * The recovery netif is always the static 192.168.0.1/24; the built-in
+	 * DHCP server only exists for clients that insist on being configured
+	 * automatically.  Point users at the static option as well, since a
+	 * client that never accepts the OFFER looks exactly like a dead server.
+	 */
+	printf("XR1710G HTTP recovery: open http://192.168.0.1/ "
+	       "(PC static 192.168.0.10/255.255.255.0, or DHCP 192.168.0.2-50)\n");
+
 	env_set("ipaddr", "192.168.0.1");
 	env_set("netmask", "255.255.255.0");
 	env_set("gatewayip", "0.0.0.0");
