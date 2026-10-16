@@ -16,7 +16,7 @@ CONFIG_BUILD_TARGET="u-boot.img"
 CONFIG_FIT=y
 CONFIG_FIT_VERBOSE=y
 CONFIG_LEGACY_IMAGE_FORMAT=y
-CONFIG_BOOTDELAY=3
+CONFIG_BOOTDELAY=1
 CONFIG_DEFAULT_FDT_FILE="xg2010g"
 CONFIG_SYS_PBSIZE=1049
 CONFIG_SYS_CONSOLE_IS_IN_ENV=y
@@ -69,6 +69,12 @@ CONFIG_MTD=y
 CONFIG_DM_MTD=y
 CONFIG_MTD_SPI_NAND=y
 CONFIG_MTD_UBI=y
+# Fastmap turns the every-boot UBI attach from a full scan of ~3500 PEBs
+# (0x1b700000 / 128 KiB) into reading a handful of anchor PEBs.  AUTOCONVERT
+# writes a fastmap on the first attach of a device that has none yet, so
+# existing installs keep working without a reformat.
+CONFIG_MTD_UBI_FASTMAP=y
+CONFIG_MTD_UBI_FASTMAP_AUTOCONVERT=1
 CONFIG_DM_SPI_FLASH=y
 CONFIG_SPI_FLASH_EON=y
 CONFIG_SPI_FLASH_GIGADEVICE=y

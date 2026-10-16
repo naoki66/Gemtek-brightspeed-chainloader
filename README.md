@@ -93,12 +93,13 @@ UBI 备份为逻辑字节，对应 `ubi write` 输入语义。
 | `configs/xr1710g_defconfig` | XR1710G / W1700K / W1701K |
 | `configs/xg2010g_defconfig` | XG2010G |
 
-关键开关（以 `xr1710g_defconfig` 为准，均真实存在于文件中）：
+关键开关（下面这几项两个机型的 `configs/*_defconfig` **完全一致**，均真实存在于文件中）：
 
 - `CONFIG_ARM=y`、`CONFIG_ARCH_AIROHA=y`、`CONFIG_TARGET_AN7581=y`
 - `CONFIG_TEXT_BASE=0x81E00000`（二级 U-Boot 加载基址）
-- `CONFIG_BOOTDELAY=1`（新 env 默认值；已保存 `bootdelay=3` 的设备用 `setenv bootdelay 1; saveenv`）
-- `CONFIG_MTD_UBI_FASTMAP=y` + `CONFIG_MTD_UBI_FASTMAP_AUTOCONVERT=1`：
+- `CONFIG_BOOTDELAY=1`（两个机型都已从 3 降到 1；这是新 env 的默认值，
+  已保存 `bootdelay=3` 的设备用 `setenv bootdelay 1; saveenv` 覆盖）
+- `CONFIG_MTD_UBI_FASTMAP=y` + `CONFIG_MTD_UBI_FASTMAP_AUTOCONVERT=1`（两个机型都有）：
   把每次启动的 UBI attach 从“全盘扫描 ~3500 个 PEB”降为“读几个 anchor PEB”；
   `AUTOCONVERT` 会在首次 attach 时为没有 fastmap 的设备补写，已出厂设备无需重新格式化。
 - `CONFIG_HTTPD_RECOVERY=y`、`CONFIG_NET_LWIP=y`：HTTP 恢复服务与 lwIP 网络栈。

@@ -23,7 +23,7 @@
 | §1.1 | `xr1710g_detect_ubi_part()` **依次试 ubi / ubi1.5 / ubi1.0** | `xr1710g_ubi_layouts[]` 现在**只有 1 项**：`{ "2.0", "system" }`（xr1710g_rfb.c:79-81） |
 | §1.2 表 | "布局选择 ✅ WebUI 选 UBI 2.0 / 1.5 / 1.0" | 已从页面与代码移除（多布局视图在设备树里无对应分区） |
 | §2.1 表 | "1.5/1.0 设备的布局探测，最多 3 次 attach" | 不成立，布局只剩 1 个 |
-| §2.2 | 启动优化未说明机型范围 | `CONFIG_BOOTDELAY=1` / `FASTMAP` **只在 `xr1710g_defconfig`**；`xg2010g_defconfig` 仍是 `BOOTDELAY=3` 且**无 FASTMAP** |
+| §2.2 | 启动优化未说明机型范围 | `CONFIG_BOOTDELAY=1` / `FASTMAP` 原先**只在 `xr1710g_defconfig`**；两个机型现已同构（见 §2.2、§11） |
 | §3.2 | "备份 437 MiB 的 `ubi` 分区"、"`vendor` / `ubi` 分区名" | 分区名是 `bootloader / uenv / dsd / chainloader / system / reserved_bmt`；`system` = **439 MiB** |
 | §3.2 | `index.html 43.4 KB → 50.8 KB`，`fsdata 245.8 KB → 282.9 KB` | 实测 `index.html` = **68,805 B**，`fsdata_xr1710g.c` = **374,132 B** |
 | §3.2 | `mock_server.py`、`.workbuddy/verify_recovery_backup.py` | 两者**已不在树内**，相关描述删除 |
@@ -96,8 +96,8 @@ ubi_read_production = run ubi_mount && ubi read $loadaddr fit && iminfo $loadadd
 | 一级引导 | 厂商 ECNT `bootm` + chainloader FIT | TF-A BL2 → FIP |
 | 核心版本 | **2026.07** | **2026.10** |
 | env 后端 | **MTD `uenv`**（`CONFIG_ENV_IS_IN_MTD`） | UBI（`CONFIG_AIROHA_UBI_ENV`） |
-| UBI fastmap | ✅ `MTD_UBI_FASTMAP` + `AUTOCONVERT`（**仅 xr1710g**） | ✅ `MTD_UBI_FASTMAP` + `AUTOCONVERT` |
-| bootdelay | 1（xr1710g）/ 3（xg2010g） | 3 + `AUTOBOOT_MENU_SHOW`（还会显示菜单，更慢） |
+| UBI fastmap | ✅ `MTD_UBI_FASTMAP` + `AUTOCONVERT`（xr1710g / xg2010g **都有**） | ✅ `MTD_UBI_FASTMAP` + `AUTOCONVERT` |
+| bootdelay | 1（xr1710g / xg2010g **都是**） | 3 + `AUTOBOOT_MENU_SHOW`（还会显示菜单，更慢） |
 | 一级读取量 | **64 MiB**（厂商默认；slot 镜像仅 ~1 MiB） | 不适用 |
 | 启动期 UBI attach | env 1 次（MTD）；`system` attach 1 次 | 1 次 |
 | 启动期写 flash | `factory` 同步（不一致才写） | 无 |
@@ -120,13 +120,13 @@ ubi_read_production = run ubi_mount && ubi read $loadaddr fit && iminfo $loadadd
 |---|---|---|---|
 | 1 | 厂商 `flash read 0x602100 0x4000000` | 读 64 MiB，实际只需 ~1 MiB | 厂商 env，我们改不了代码 |
 | 2 | `ubi read fit` | 整个 fit 卷（数十 MiB）搬进 RAM | 不可避免（`bootm` 需要完整 ITB） |
-| 3 | UBI attach 全盘扫描 | 0x1B700000 / 128 KiB ≈ **3500 个 PEB**，逐个读 EC/VID 头 | ✅ 已优化（fastmap，仅 xr1710g） |
-| 4 | bootdelay | 3 s 空等 | ✅ xr1710g 已降到 1 s；xg2010g 未改 |
+| 3 | UBI attach 全盘扫描 | 0x1B700000 / 128 KiB ≈ **3500 个 PEB**，逐个读 EC/VID 头 | ✅ 已优化（fastmap，两个机型） |
+| 4 | bootdelay | 3 s 空等 | ✅ 两个机型都已降到 1 s |
 | 5 | `xr1710g_sync_factory_part()` | 两次 24 KiB 读 + DSD 读，10 ms 量级 | 不是瓶颈，但保留"可能写 flash"的面 |
 
 ### 2.2 已落地的改动
 
-1. **`configs/xr1710g_defconfig`**
+1. **`configs/xr1710g_defconfig` 与 `configs/xg2010g_defconfig`**（两个机型同构）
    ```diff
    -CONFIG_BOOTDELAY=3
    +CONFIG_BOOTDELAY=1
@@ -140,13 +140,12 @@ ubi_read_production = run ubi_mount && ubi read $loadaddr fit && iminfo $loadadd
    - `CONFIG_BOOTDELAY` 只影响新 env 的默认值；已保存 `bootdelay=3` 的设备
      用 `setenv bootdelay 1; saveenv` 即可。按键/串口打断仍然有效，
      恢复按键是在 `board_late_init()`（autoboot 之前）采样的，**不受 bootdelay 影响**。
-2. **README / docs**：把厂商一级 `bootcmd` 的长度从 `0x4000000` 说明为可改成 `0x100000`
-   （`README.md:178`、`docs/flashing-xr1710g.md:208/347`），只能手工在 `ECNT>` 提示符下执行。
+2. **README（§7 已知限制）**：把厂商一级 `bootcmd` 的长度从 `0x4000000` 说明为可改成
+   `0x100000`（`README.md:186-187`）。两个机型的一级 env 结构相同（FIT 同样落在 `0x602100`），
+   所以这条对 XG2010G 同样适用；只能手工在 `ECNT>` 提示符下执行，本项目不自动改写。
 
 ### 2.3 未做（附原因）
 
-- **⚠️ `xg2010g_defconfig` 没跟上**：`CONFIG_BOOTDELAY=3`、无 `FASTMAP`。
-  两个机型按约定应保持同构，这是一处**待补齐的差异**，建议随下次改动一并处理。
 - **把布局探测结果缓存进 env**：布局只剩 1 个以后，收益基本消失，可以不做。
 - **改厂商 env**：只能手工在 ECNT 提示符下执行，写进 README，不做自动改写。
 - **`iminfo` 校验**：an758x 在 `ubi_read_production` 里带 `iminfo`，校验完整但会
@@ -758,7 +757,7 @@ loadable）会就地解压，`kernel` 则延后到 `bootm_load_os()`；
   5. `xg2010g` 同样过一遍。
 - **待办**：
   1. §4.8 / §4.9 的真机验证（上面 5 步）；
-  2. `xg2010g_defconfig` 补齐 `BOOTDELAY=1` + `FASTMAP`（§2.3）；
+  2. ~~`xg2010g_defconfig` 补齐 `BOOTDELAY=1` + `FASTMAP`（§2.3）~~ ✅ 已完成（§11）；
   3. §7.4 压缩方案的真机验证；
   4. §4.9 末尾的 PHY8（WAN）掉电隐患：确认 WAN 口在进过恢复模式后是否还连接；
   5. §9.3 末尾：`UBOOTVERSION` 是全局常量 `XR1710G`，`XG2010G` 的版本串仍是
@@ -888,4 +887,53 @@ WAN 服务优先于那个"把 GDM2 挪作 GDM4 用"的实验；要跑实验就 `
   `1bd6c10`（本节）与 `d59b7f5`（删重复横幅）已提交，等待真机验证。
 - **未上机验证**：本机无 aarch64 交叉工具链，`driver` 改动只做了静态审查 +
   `setlocalversion` 侧的本地实测。
+
+## 11. XG2010G 启动速度对齐（本轮）
+
+两个机型的分区格式已经一致（都是 UBI 2.0、单一 `system` 布局），§2 的启动优化
+因此可以**无差别地套用到 XG2010G**。本轮把 `configs/xg2010g_defconfig` 补齐到与
+`configs/xr1710g_defconfig` 同构，消除 §2.3 里那处"待补齐的差异"：
+
+| 项 | xr1710g | xg2010g（改前） | xg2010g（改后） |
+|---|---|---|---|
+| `CONFIG_BOOTDELAY` | 1 | 3 | **1** |
+| `CONFIG_MTD_UBI_FASTMAP` | y | （未设） | **y** |
+| `CONFIG_MTD_UBI_FASTMAP_AUTOCONVERT` | 1 | （未设） | **1** |
+
+改完之后，两个 defconfig 的剩余差异**全部是机型固有**的，不应该统一：
+
+| 条目 | xr1710g | xg2010g |
+|---|---|---|
+| `CONFIG_BOARD_*` | `CONFIG_BOARD_XR1710G=y` | `CONFIG_BOARD_XG2010G=y` |
+| `CONFIG_DEFAULT_DEVICE_TREE` | `airoha/xr1710g` | `airoha/xg2010g` |
+| `CONFIG_DEFAULT_FDT_FILE` | `xr1710g` | `xg2010g` |
+| `CONFIG_ENV_SOURCE_FILE` | `xr1710g` | `xg2010g` |
+| `CONFIG_LOCALVERSION` | （空） | `-recovery` |
+| `CONFIG_POSITION_INDEPENDENT` | 未设 | y |
+| `CONFIG_SYS_MALLOC_LEN` | 未设 | `0x800000` |
+| `CONFIG_CMD_SAVEENV` | 未设 | y |
+| PHY | `CONFIG_PHY_REALTEK=y` | `CONFIG_PHY_REALTEK=y` 另加 `PHY_AIROHA` / `EN8811` / `EN8811_BUILTIN_FW` |
+| `CONFIG_LZMA_SIZE_OPTIMIZATION` | 未设 | y |
+
+### 11.1 bootdelay 不需要动 env
+
+两个机型的 env 源文件（`board/airoha/an7581/xr1710g.env`、`xg2010g.env`）**都没有**定义
+`bootdelay`，所以生效的就是编译进固件的 `CONFIG_BOOTDELAY`——改 defconfig 就够了。
+真机上若 `printenv bootdelay` 仍显示旧值（3），说明该值被 `saveenv` 持久化过，
+`setenv bootdelay 1; saveenv` 覆盖即可。
+
+> ⚠️ 在**二级** U-Boot 里 `saveenv` 会覆盖原厂 `uenv`（见 `docs/flashing-xr1710g.md` §6）。
+> 不要单纯为了 bootdelay 去 `saveenv`。
+
+### 11.2 FASTMAP 对已出厂设备的行为
+
+`AUTOCONVERT=1` 保证**无需重新格式化**：没有 fastmap 的设备在首次 attach 时被写入一份，
+之后每次启动都走 anchor PEB 快路径。**首次** attach（即写 fastmap 的那一次）会比之后慢，
+这是预期行为，不是回归。
+
+### 11.3 验证状态
+
+- CI：见本轮提交触发的 `build.yml` 运行（`Build xr1710g` / `Build xg2010g` 两个 job）。
+- 真机判据：串口启动日志里 UBI attach 的耗时明显下降；
+  `printenv bootdelay` = 1（该设备此前未持久化过 bootdelay 时）。
 
