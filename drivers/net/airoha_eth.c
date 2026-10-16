@@ -2342,8 +2342,35 @@ static bool airoha_recovery_link_flap_enabled(void)
 {
 	const char *flap = env_get("recovery_link_flap");
 
-	if (flap && (!strcmp(flap, "0") || !strcmp(flap, "off") ||
-		     !strcmp(flap, "disable") || !strcmp(flap, "false")))
+	/*
+	 * Off by default; opt in with recovery_link_flap=1.
+	 *
+	 * The flap was meant to force a host that was already connected to
+	 * restart DHCP by bouncing the media. In practice it caused more harm
+	 * than good:
+	 *
+	 *  - it power-cycled the RTL8261 10G PHYs, which only forward frames
+	 *    after the firmware patch applied by airoha_rtl8261_minimal_init()
+	 *    at probe time; the flap path does not re-apply it (see the
+	 *    "avoids PHY resets and RTL8261 patching" note in
+	 *    airoha_switch_recovery_runtime_init()), so the 10G port stopped
+	 *    linking until the next cold boot;
+	 *  - the 1.5 s down window plus a >=2 s settle is a link outage right
+	 *    when the host starts DHCP, and gating egress on
+	 *    recovery_flap_active throws away the first replies;
+	 *  - the PHYs are already reset by hardware on power-up, so the host
+	 *    sees a fresh link either way and starts a new DHCP transaction on
+	 *    its own.
+	 *
+	 * an758x has no link flap at all and recovers fine. The real reason a
+	 * 1G client never got a reply was the switch flood-map bug fixed in
+	 * airoha_switch_recovery_runtime_init(), not a missing link bounce.
+	 */
+	if (!flap || !*flap)
+		return false;
+
+	if (!strcmp(flap, "0") || !strcmp(flap, "off") ||
+	    !strcmp(flap, "disable") || !strcmp(flap, "false"))
 		return false;
 
 	return true;
@@ -4528,16 +4555,14 @@ static void airoha_recovery_flap_service(struct airoha_eth *eth, ulong now)
  */
 void airoha_recovery_restart_links(struct udevice *dev)
 {
-	const char *link_flap_env = "recovery_link_flap_ms";
-	const ulong link_flap_default = AIROHA_RECOVERY_LAN_FLAP_MIN_MS;
 	struct airoha_eth *eth = dev_get_priv(dev);
 	bool cycle_lan = airoha_recovery_port_is_1g() ||
 			 airoha_recovery_dual_service_enabled();
 	bool cycle_10g = airoha_recovery_accept_gdm4_rx();
 	bool cycle_wan = airoha_recovery_port_is_wan();
 	bool flap_links = airoha_recovery_link_flap_enabled();
-	bool lan_cycle = false, phy5_cycle = false, phy8_cycle = false;
-	ulong down_ms = 0, link_down_ms;
+	bool lan_cycle = false;
+	ulong down_ms;
 	int ret;
 
 	if (!cycle_wan) {
@@ -4556,43 +4581,46 @@ void airoha_recovery_restart_links(struct udevice *dev)
 		}
 	}
 
-	if (!flap_links || (!cycle_lan && !cycle_10g && !cycle_wan))
+	/*
+	 * Train the GDM4/USXGMII host path unconditionally; it must not depend
+	 * on the flap being enabled.
+	 */
+	if (cycle_10g)
+		airoha_gdm4_recovery_prime(eth);
+
+	if (!flap_links)
+		return;
+
+	/*
+	 * The flap is only ever allowed to touch the 1G copper PHYs.
+	 *
+	 * Never power-cycle the RTL8261 10G PHYs (PHY5 = 10G host, PHY8 = WAN)
+	 * from here. They only forward frames after the firmware patch and
+	 * serdes mode setup that airoha_rtl8261_minimal_init() applies at probe
+	 * time, and airoha_switch_recovery_runtime_init() deliberately skips
+	 * "PHY resets and RTL8261 patching". Clearing LPOWER and restarting
+	 * auto-negotiation does not re-apply that setup, so the PHY comes back
+	 * without its USXGMII serdes mode and the port never links again - the
+	 * reported "10G port not linked" regression, which only a cold boot
+	 * clears.
+	 *
+	 * The RTL8261 link is freshly negotiated by the hardware reset on
+	 * power-up, so there is nothing to restart here.
+	 */
+
+	if (!cycle_lan && !cycle_10g && !cycle_wan)
 		return;
 
 	if (cycle_lan) {
 		airoha_recovery_lan_phy_set_power(eth, false, false);
 		lan_cycle = !!eth->recovery_lan_wake_pending;
 	}
-	if (cycle_10g) {
-		phy5_cycle = true;
-		eth->rtl8261_phy5_wake_pending = true;
-		ret = airoha_recovery_rtl8261_set_power(eth, RTL8261_PHY5_ADDR, false);
-		if (ret) {
-			printf("airoha: recovery PHY %d power-down failed: %d\n",
-			       RTL8261_PHY5_ADDR, ret);
-		}
-	}
-	if (cycle_wan) {
-		phy8_cycle = true;
-		eth->rtl8261_phy8_wake_pending = true;
-		ret = airoha_recovery_rtl8261_set_power(eth, RTL8261_PHY8_ADDR, false);
-		if (ret) {
-			printf("airoha: recovery PHY %d power-down failed: %d\n",
-			       RTL8261_PHY8_ADDR, ret);
-		}
-	}
 
-	if (!lan_cycle && !phy5_cycle && !phy8_cycle)
+	if (!lan_cycle)
 		return;
 
-	if (lan_cycle)
-		down_ms = airoha_recovery_env_ulong("recovery_lan_flap_ms",
-						    AIROHA_RECOVERY_LAN_FLAP_MIN_MS);
-	if (phy5_cycle || phy8_cycle) {
-		link_down_ms = airoha_recovery_env_ulong(link_flap_env,
-							 link_flap_default);
-		down_ms = max(down_ms, link_down_ms);
-	}
+	down_ms = airoha_recovery_env_ulong("recovery_lan_flap_ms",
+					    AIROHA_RECOVERY_LAN_FLAP_MIN_MS);
 
 	/*
 	 * Only pull the links down here. Sleeping out the down time plus a
@@ -4602,10 +4630,11 @@ void airoha_recovery_restart_links(struct udevice *dev)
 	 * the host had to unplug/retry several times before it got an
 	 * address. airoha_recovery_flap_service() powers the links back up
 	 * on time from the main loop and waits for the real link state.
+	 *
+	 * BIT(1)/BIT(2) (the RTL8261 10G PHYs) are never set: see the note
+	 * above about not power-cycling them.
 	 */
-	eth->recovery_flap_mask = (lan_cycle ? BIT(0) : 0) |
-				  (phy5_cycle ? BIT(1) : 0) |
-				  (phy8_cycle ? BIT(2) : 0);
+	eth->recovery_flap_mask = lan_cycle ? BIT(0) : 0;
 	eth->recovery_flap_up_at_ms = get_timer(0) + down_ms;
 	eth->recovery_flap_up_ms = 0;
 	eth->recovery_flap_last_poll_ms = 0;
@@ -5678,6 +5707,7 @@ static int airoha_hw_init(struct udevice *dev, struct airoha_eth *eth)
 static void airoha_switch_recovery_runtime_init(struct airoha_eth *eth)
 {
 	u32 cpu_port_mask = BIT(AIROHA_RECOVERY_SWITCH_CPU_PORT);
+	u32 flood_port_mask = GENMASK(7, 0);
 
 	if (!eth->switch_regs)
 		return;
@@ -5687,10 +5717,42 @@ static void airoha_switch_recovery_runtime_init(struct airoha_eth *eth)
 	 * avoids PHY resets and RTL8261 patching. It makes http_recovery
 	 * re-enterable after eth_halt()/eth_init().
 	 */
+	/*
+	 * The flood map must cover *every* port; the per-port PCR PORT_MATRIX
+	 * written below is what actually restricts delivery.
+	 *
+	 * SWITCH_PCR(n).PORT_MATRIX is the set of ports a frame ingressing on
+	 * port n may egress to, and SWITCH_MFC.BC_FFP/UNM_FFP/UNU_FFP picks the
+	 * ports a flooded frame is copied to. The delivered set is the
+	 * intersection of the two. With the flood map limited to the CPU port:
+	 *
+	 *   - a broadcast from a front port (matrix = cpu_port_mask) floods to
+	 *     {6} and reaches the CPU - that is why the client's DISCOVER shows
+	 *     up in the log;
+	 *   - a broadcast from the CPU (matrix = user ports 0..5) floods to
+	 *     {6}, the intersection is empty, and the frame is dropped inside
+	 *     the switch before it ever reaches a front port.
+	 *
+	 * So every CPU-sourced flooded frame - the DHCP OFFER/ACK to
+	 * 255.255.255.255, ARP requests, any unknown unicast - was blackholed.
+	 * From the outside that reads as "the 1G port never gets an IP": the
+	 * offer is sent, the client never sees it, so it retries DISCOVER
+	 * forever and never sends REQUEST or DHCPDECLINE. A manually
+	 * configured static IP works because plain unicast follows the FDB
+	 * entry (the learned port) instead of the flood map, which is exactly
+	 * the asymmetry the field report described.
+	 *
+	 * an758x writes the full 0xff port mask here for the same reason.
+	 * Naming the CPU port too is deliberate: the front-port matrices are
+	 * cpu_port_mask, so the intersection still resolves to "client to CPU"
+	 * for front-port traffic and "CPU to front ports" for CPU traffic -
+	 * while the CPU port's own matrix (user ports only) prevents our
+	 * broadcasts from hair-pinning back into our own RX ring.
+	 */
 	airoha_switch_wr(eth, SWITCH_MFC,
-			 FIELD_PREP(SWITCH_BC_FFP, cpu_port_mask) |
-				 FIELD_PREP(SWITCH_UNM_FFP, cpu_port_mask) |
-				 FIELD_PREP(SWITCH_UNU_FFP, cpu_port_mask));
+			 FIELD_PREP(SWITCH_BC_FFP, flood_port_mask) |
+				 FIELD_PREP(SWITCH_UNM_FFP, flood_port_mask) |
+				 FIELD_PREP(SWITCH_UNU_FFP, flood_port_mask));
 	airoha_switch_rmw(eth, SWITCH_CFC, SWITCH_CPU_PMAP,
 			  FIELD_PREP(SWITCH_CPU_PMAP, cpu_port_mask));
 	airoha_switch_rmw(eth, SWITCH_AGC, 0, SWITCH_LOCAL_EN);
