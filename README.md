@@ -54,6 +54,10 @@ flash write 0x600000 0x100000 0x81800000
 reset
 ```
 
+5. 可选：顺手把原厂一级配方的 `flash read` 长度从 `0x4000000` 改成 `0x100000`
+   （读 64 MiB → 读 1 MiB，这是启动耗时里最大的一项）；
+   完整说明见刷机教程「缩短原厂一级 U-Boot 的读取长度」一节。
+
 > ⚠️ 上面的 `saveenv` / `flash` 命令**只能在原厂 `ECNT>` 提示符**下执行。
 > 详见 §6 常见问题：`uenv` 分区被原厂与二级 U-Boot 共用，在 chainloader 里 `saveenv` 会
 > 覆盖原厂环境导致无法启动。
@@ -114,14 +118,22 @@ UBI 备份为逻辑字节，对应 `ubi write` 输入语义。
 | `0x602100` | chainloader FIT（内嵌 DTB + shim + 二级 U-Boot） | `d0 0d fe ed`（FDT_MAGIC） |
 
 槽位上限 `RECOVERY_MAX_UBOOT_SIZE = 1 MiB`（`0x100000`）。
-最近一次 CI 产物（`xr1710g-chainloader-20261016-135953-g0d90131373e4-slot.bin`）
-实测 **1,001,522 字节（978 KiB）**，余量 **46 KiB（4.5%）**。
+最近一次双机型 CI 产物（版本串 `…-2026-10-16-g14def0596556`）：
+
+| 机型 | slot 字节 | KiB | 余量 |
+|---|---|---|---|
+| `xr1710g` | 1,002,258 | 978.8 | 46,318 B / 45.2 KiB（4.4%） |
+| `xg2010g` | 1,014,506 | 990.7 | **34,070 B / 33.3 KiB（3.2%）** |
+
+> ⚠️ **XG2010G 的余量更小（少约 12 KiB）**，因为它多编了
+> `PHY_AIROHA` / `EN8811` / `EN8811_BUILTIN_FW`。
+> **判断"快满了"要以 XG2010G 为准**；超限会以 CI 失败暴露（`MAX_SLOT_SIZE` 闸门）。
 
 其中约 98% 是 FIT 里以 `compression = "none"` 存放的**二级 U-Boot 本体**
-（`uboot@1`，982,768 字节；`fdt@1` 仅 266 字节、`kernel@1` shim 8,632 字节）。
-把它声明为 `compression = "gzip"` 可把槽位降到约 429 KiB（实测压缩率 43.2%），
+（xr1710g 的 `uboot@1` 983,504 字节；`fdt@1` 仅 266 字节、`kernel@1` shim 8,632 字节）。
+把它声明为 `compression = "gzip"` 可把槽位降到约 430 KiB（实测压缩率 43.2%），
 是比扩容分区便宜得多的做法——详见
-[BOOT-AND-RECOVERY-OPTIMIZATION.md](BOOT-AND-RECOVERY-OPTIMIZATION.md) §5 与 §7。
+[BOOT-AND-RECOVERY-OPTIMIZATION.md](BOOT-AND-RECOVERY-OPTIMIZATION.md) §6 与 §7。
 
 ### 5.3 二级 U-Boot 启动环境变量（`board/airoha/an7581/xr1710g.env`）
 
@@ -145,7 +157,7 @@ recovery_size_uboot=0x100000
   被端口策略丢弃的包现在会限流打印日志（不再静默）。
 - WAN 口（GDM2 + RTL8261 PHY8）走的是**另一份** USXGMII PCS（XPON serdes，
   `pcs-handle = &pon_pcs`），U-Boot 里已按 lan2 的流程一并拉起；
-  细节见 `BOOT-AND-RECOVERY-OPTIMIZATION.md` §10 / §12。
+  细节见 `BOOT-AND-RECOVERY-OPTIMIZATION.md` §5。
 
 ---
 
@@ -173,7 +185,8 @@ recovery_size_uboot=0x100000
 - **WAN 口能协商速率、网卡灯闪，但客户端拿不到 IP，串口也没有后续日志**：
   WAN 的 serdes 是 XPON 块里的另一个 USXGMII PCS 实例，早期 U-Boot 只初始化了 lan2 的那一个，
   所以 GDM2 一帧都发不出。现已把 lan2 的 PCS bring-up 参数化后复用给 WAN
-  （`BOOT-AND-RECOVERY-OPTIMIZATION.md` §12）。逐项判据见该节 §12.3。
+  （`BOOT-AND-RECOVERY-OPTIMIZATION.md` §5，根因归档见其 §10 坑 5）。
+  逐项判据见该文档 §12。
 - **本机没有 aarch64 交叉工具链，所有 C 改动未经编译验证**：请在 CI / 有工具链的环境构建
   （详见 §7 已知限制）。
 
@@ -191,8 +204,6 @@ recovery_size_uboot=0x100000
 - **DHCP 双路径**：raw 兜底 vs UDP PCB 双收包路径并存，raw 路径是唯一实际生效的；
   改为单路径需确认 lwIP 在广播场景下的收包行为，风险不低，暂未改。
 - **布局探测结果未缓存**：`env` 本身在 UBI 内，探测函数存在循环依赖，未做持久化缓存。
-- **原厂一级 `bootcmd` 长度**：原厂默认 `flash read 0x602100 0x4000000`（读 64 MiB），
-  实际只需 ~1 MiB；只能手工在 `ECNT>` 提示符下改成 `0x100000`，本项目不自动改写。
 
 ---
 
@@ -206,7 +217,9 @@ recovery_size_uboot=0x100000
 
 - [docs/flashing-xr1710g.md](docs/flashing-xr1710g.md) — XR1710G（W1700K / W1701K）TTL 刷机教程
 - [docs/flashing-xg2010g.md](docs/flashing-xg2010g.md) — XG2010G 刷机教程
-- [BOOT-AND-RECOVERY-OPTIMIZATION.md](BOOT-AND-RECOVERY-OPTIMIZATION.md) — 引导链路、启动速度、恢复/备份、DHCP 优化与设计权衡
+- [BOOT-AND-RECOVERY-OPTIMIZATION.md](BOOT-AND-RECOVERY-OPTIMIZATION.md) —
+  引导链路 / 启动速度 / 恢复与备份 / DHCP 与端口策略 / 网口数据通路（两个 USXGMII PCS）/
+  槽位体积与扩容评估 / 版本号与发布约定 / 容易复发的坑 / 待办 / 真机验证判据
 
 ---
 

@@ -118,6 +118,9 @@ reset
 执行后原厂 U-Boot 会从偏移 `0x600000` 读取 1 MiB chainloader 并启动。
 *The stock U-Boot now reads the 1 MiB chainloader from offset `0x600000` and boots it.*
 
+> 顺便建议连原厂一级配方的**读取长度**一起改小，能显著缩短启动时间 —— 见 §6。
+> *While you are here, also shrink the read length of the vendor recipe — see §6.*
+
 ### 3.6 刷机后：安装 OpenWrt / After flashing: install OpenWrt
 
 1. `reset` 后 chainloader（第二级 U-Boot）启动，串口可见其横幅。
@@ -158,7 +161,38 @@ reset
 | 刷入方式 / Flashing | TTL + TFTP 写 chainloader；之后 HTTP Recovery 网页刷固件 | BL2/preloader 写 0x0，XMODEM 送 FIP，Web recovery 重建 UBI |
 | 适用机型 / Devices | XR1710G / XG2010G | 16 个 AN758x 目标 |
 
-## 6. 常见问题 / FAQ
+## 6. 可选优化：缩短原厂一级 U-Boot 的读取长度 / Optional: shorten the vendor U-Boot read
+
+原厂一级 U-Boot 的配方一次读 **64 MiB**，而 chainloader 实际只占 1 MiB ——
+这是整个启动过程中**最大的一项耗时**。在 `ECNT>` 下 `printenv bootcmd` 若看到这种形式：
+
+```sh
+flash read 0x602100 0x4000000 $loadaddr; bootm
+```
+
+把长度从 `0x4000000` 改成 `0x100000` 即可（偏移 `0x602100` 是 chainloader FIT 的固定位置，
+**不要动**）：
+
+```sh
+ECNT> setenv bootcmd "flash read 0x602100 0x100000 \$loadaddr; bootm"
+ECNT> saveenv
+```
+
+*The stock recipe reads 64 MiB while the chainloader only occupies 1 MiB — the single largest
+item in boot time. Change the length from `0x4000000` to `0x100000`, leaving the offset alone.*
+
+- **必须在原厂 U-Boot（`ECNT>`）下执行**，本项目不会自动改写原厂 env。
+  *Run it at the vendor prompt (`ECNT>`); this project never rewrites the vendor environment.*
+- 这里的 `saveenv` 是**正确用法** —— `uenv` 就是原厂 U-Boot 自己的 env 分区。
+  反之，**在二级 chainloader 里绝不能 `saveenv`**（见 §7）。
+  *`saveenv` is correct *here*: `uenv` is the vendor U-Boot's own environment partition.
+  Never run it from the second-stage chainloader (see §7).*
+- XR1710G 与 XG2010G 的一级 env 结构相同（FIT 同样落在 `0x602100`），这条对两个机型都适用。
+  *XR1710G and XG2010G share the same first-stage layout, so this applies to both.*
+- 若你的 `bootcmd` 是 `flash imgread 2048;bootm` 这种形式，说明已经是按分区读，无需改动。
+  *If your `bootcmd` already looks like `flash imgread 2048;bootm`, there is nothing to change.*
+
+## 7. 常见问题 / FAQ
 
 - **`T T T...` 后自动启动**：打断超时，重新上电并提前按键。
   *Missed the interrupt window — power-cycle and press earlier.*
@@ -282,7 +316,7 @@ reset
      IP/TX/RX 都正常，问题只在 DHCP 回复。
      *Validate TX/RX from U-Boot with `ping 192.168.0.10`.*
 
-## 7. 恢复原厂 `uenv` 分区 / Restoring the vendor `uenv` partition
+## 8. 恢复原厂 `uenv` 分区 / Restoring the vendor `uenv` partition
 
 > **刷机前请务必备份 `mtd1/uenv`（2 MiB 整分区）**：这是原厂 U-Boot 的 env 分区，同时也被
 > chainloader 读取（见 FAQ）。备份方式见 [5. 与 uboot-an758x 的区别] 中的 Linux 侧 `dd | tftp` 用法，
@@ -301,7 +335,7 @@ XR1710G 的 `uenv` 分区布局（来自原厂备份，整分区 2 MiB）：
 `loadaddr=0x81800000`、`bootdelay=4`、`fdt_high=0xac000000`、`root=/dev/mtdblock4 ro`、
 `ubi.mtd=system`、`serverip=192.168.0.205`、`ipaddr=192.168.0.1`。
 
-### 7.1 在 chainloader（二级 U-Boot）下恢复 / From the chainloader prompt
+### 8.1 在 chainloader（二级 U-Boot）下恢复 / From the chainloader prompt
 
 电脑网卡设静态 `192.168.0.10/24`，TFTP 服务器根目录放 `01_env_data.bin`：
 
@@ -314,7 +348,7 @@ mtd erase uenv 0 0x200000
 mtd write uenv 0x90000000 0 0x200000
 ```
 
-### 7.2 在原厂 U-Boot（`ECNT>`）下恢复 / From the vendor prompt
+### 8.2 在原厂 U-Boot（`ECNT>`）下恢复 / From the vendor prompt
 
 ```sh
 ECNT> setenv serverip 192.168.0.10
@@ -336,7 +370,7 @@ ECNT> flash write 0x300000 0x80000 0x90100000
 ECNT> flash write 0x380000 0x80000 0x90180000
 ```
 
-### 7.3 恢复后 / After restoring
+### 8.3 恢复后 / After restoring
 
 1. 在原厂提示符核对：`printenv bootcmd` 应为 `flash imgread 2048;bootm`，
    `printenv fdt_high`=`0xac000000`，`printenv bootdelay`=`4`。

@@ -108,6 +108,16 @@ reset
 执行后原厂 U-Boot 会从偏移 `0x600000` 读取 1 MiB chainloader 并启动。
 *The stock U-Boot now reads the 1 MiB chainloader from offset `0x600000` and boots it.*
 
+> **⚠️ 上面这几条命令只能在`原厂 U-Boot`（提示符 `ECNT>`）下执行。**
+> `uenv` 是原厂 U-Boot 的 env 分区，二级 chainloader 只是共用读取它；
+> 在 chainloader 里 `saveenv` 会覆盖原厂 env，使原厂 U-Boot 之后无法启动 chainloader
+> （卡在 `ECNT>` 并报 `Unknown command 'ubi'`）。详见 FAQ。
+> **⚠️ Run these only at the vendor prompt (`ECNT>`).** Running `saveenv` from the chainloader
+> overwrites the vendor environment and strands the vendor bootloader. See the FAQ.
+>
+> 顺便建议连原厂一级配方的**读取长度**一起改小，能显著缩短启动时间 —— 见 §6。
+> *While you are here, also shrink the read length of the vendor recipe — see §6.*
+
 ### 3.6 刷机后：安装 OpenWrt / After flashing: install OpenWrt
 
 1. `reset` 后 chainloader（第二级 U-Boot）启动，串口可见其横幅。
@@ -142,7 +152,38 @@ reset
 | 刷入方式 / Flashing | TTL + TFTP 写 chainloader；之后 HTTP Recovery 网页刷固件 | BL2/preloader 写 0x0，XMODEM 送 FIP，Web recovery 重建 UBI |
 | 适用机型 / Devices | XR1710G / XG2010G | 16 个 AN758x 目标 |
 
-## 6. 常见问题 / FAQ
+## 6. 可选优化：缩短原厂一级 U-Boot 的读取长度 / Optional: shorten the vendor U-Boot read
+
+原厂一级 U-Boot 的配方一次读 **64 MiB**，而 chainloader 实际只占 1 MiB ——
+这是整个启动过程中**最大的一项耗时**。在 `ECNT>` 下 `printenv bootcmd` 若看到这种形式：
+
+```sh
+flash read 0x602100 0x4000000 $loadaddr; bootm
+```
+
+把长度从 `0x4000000` 改成 `0x100000` 即可（偏移 `0x602100` 是 chainloader FIT 的固定位置，
+**不要动**）：
+
+```sh
+ECNT> setenv bootcmd "flash read 0x602100 0x100000 \$loadaddr; bootm"
+ECNT> saveenv
+```
+
+*The stock recipe reads 64 MiB while the chainloader only occupies 1 MiB — the single largest
+item in boot time. Change the length from `0x4000000` to `0x100000`, leaving the offset alone.*
+
+- **必须在原厂 U-Boot（`ECNT>`）下执行**，本项目不会自动改写原厂 env。
+  *Run it at the vendor prompt (`ECNT>`); this project never rewrites the vendor environment.*
+- 这里的 `saveenv` 是**正确用法** —— `uenv` 就是原厂 U-Boot 自己的 env 分区。
+  反之，**在二级 chainloader 里绝不能 `saveenv`**（见 §7）。
+  *`saveenv` is correct *here*: `uenv` is the vendor U-Boot's own environment partition.
+  Never run it from the second-stage chainloader (see §7).*
+- XR1710G 与 XG2010G 的一级 env 结构相同（FIT 同样落在 `0x602100`），这条对两个机型都适用。
+  *XR1710G and XG2010G share the same first-stage layout, so this applies to both.*
+- 若你的 `bootcmd` 是 `flash imgread 2048;bootm` 这种形式，说明已经是按分区读，无需改动。
+  *If your `bootcmd` already looks like `flash imgread 2048;bootm`, there is nothing to change.*
+
+## 7. 常见问题 / FAQ
 
 - **`T T T...` 后自动启动**：打断超时，重新上电并提前按键。
   *Missed the interrupt window — power-cycle and press earlier.*
