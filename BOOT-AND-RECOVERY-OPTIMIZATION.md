@@ -881,6 +881,10 @@ WAN 服务优先于那个"把 GDM2 挪作 GDM4 用"的实验；要跑实验就 `
 - `gdm2[fwd=00000004]` —— 旧代码是 `0000000f`（DROP），这是 WAN 入向通不通的判据
 - WAN 口插 PC 后，串口应出现 `DHCP: DISCOVER from ... (rx fport 2)` 紧跟 `REQUEST`
 
+> ⚠️ 本节（`1bd6c10`）只解决了**软件**侧的四层屏蔽。真机仍拿不到 IP 的**真因**是
+> WAN 的 serdes PCS 从未在 U-Boot 里被拉起，见 **§12**。§12 之后该字段扩充为
+> `wan[serve=.. link=.. ready=.. pcslink=.. usx=.. rx=.. xfi[..] pcs[..]]`。
+
 ### 10.5 验证状态
 
 - CI run **38920168225**（`3216ceb`，§9 的 Makefile 改动）✅；
@@ -936,4 +940,90 @@ WAN 服务优先于那个"把 GDM2 挪作 GDM4 用"的实验；要跑实验就 `
 - CI：见本轮提交触发的 `build.yml` 运行（`Build xr1710g` / `Build xg2010g` 两个 job）。
 - 真机判据：串口启动日志里 UBI attach 的耗时明显下降；
   `printenv bootdelay` = 1（该设备此前未持久化过 bootdelay 时）。
+
+## 12. WAN 口的 serdes 从来没被拉起来（本轮，§10 的真因）
+
+§10 把 WAN 从**软件**侧放开了（DHCP 策略、PHY8 电源、GDM2 转发、广播镜像），
+但真机仍然是：**能协商速率、网卡灯间隔闪烁，却拿不到 IP，串口没有任何后续日志**
+（连一条 `DHCP: DISCOVER … (rx fport 2)` 都没有）。
+
+缺的不是软件策略，而是**物理层**：WAN 的 serdes PCS 在 U-Boot 里从未被初始化。
+
+### 12.1 AN7581 有两个 USXGMII PCS
+
+厂商内核 DTS 写得很清楚（`an7581-xr1710g.dts` + `an7581.dtsi`）：
+
+| 端口 | GDM | PHY | `pcs-handle` | `phy-mode` | PCS 寄存器基址 |
+|---|---|---|---|---|---|
+| `lan2`（10G 面板口） | GDM4 | PHY5 | `&eth_pcs` | `usxgmii` | `0x1fa09000` / `0x1fa74000` / `0x1fa75900` / `0x1fa76000` / `0x1fa7a000` / `0x1fa7b000` |
+| `wan` | GDM2 | PHY8 | `&pon_pcs` | `usxgmii` | `0x1fa08000` / `0x1fa84000` / `0x1fa85900` / `0x1fa86000` / `0x1fa8a000` / `0x1fa8b000` |
+
+两个实例**布局完全相同**，只是基址差一档；SCU 的 mux（`SCU_WAN_SEL_USXGMII`）
+把那个空着的 XPON serdes 变成 WAN 口的 USXGMII PCS。
+
+U-Boot 的 `drivers/net/airoha_eth.c` 只 `map_sysmem()` 并初始化了 **eth PCS**：
+它把 6 个基址硬编码成宏，`pon_pcs` 从未被映射、从未被编程，`XPON_PHY_RST` /
+`XPON_MAC_RST` 也从未释放。PHY8 是靠普通 MDIO 自己协商出铜口链路的（所以灯在闪、
+速率能谈），但 **GDM2 一个帧都发不出去** —— 完全对得上"灯闪、无 IP、串口无日志"。
+
+### 12.2 改法：把 LAN2 的 PCS 启动流程参数化后复用
+
+按"LAN2 驱动和 WAN 驱动一样，复用"的思路，把整套 USXGMII bring-up 从
+"假设操作 eth 实例"改成"操作传入的实例"：
+
+- 新增 `struct airoha_ext_pcs { xfi_mac, multi_sgmii, usxgmii, rate_adp, ana, pma, ready }`，
+  `struct airoha_eth` 里放两份：`pcs`（GDM4/PHY5）与 `wan_pcs`（GDM2/PHY8），
+  取代原来的 6 个 `eth_pcs_*` 指针和 `gdm4_pcs_ready` 标志位。
+- 原先吃 `struct airoha_eth *` 的辅助函数全部改吃 `struct airoha_ext_pcs *pcs`：
+  `airoha_eth_pcs_pre_config()`、`..._init_usxgmii()`、`..._interrupt_init_usxgmii()`、
+  `..._post_config()`、`airoha_eth_gdm4_phya_init()`、`..._cdr_reset()`、
+  `..._restart_an()`、`..._select_speed_mode()`、`..._set_speed_mode()`、
+  `airoha_gdm4_pcs_link_up()`、`airoha_eth_gdm4_have_rx_signal()`、`airoha_usxgmii_link_up()`。
+- 再按"PHY 侧"参数化：`airoha_eth_gdm4_sync_rtl8261(eth, pcs, phy_addr, *speed)`、
+  `airoha_eth_gdm4_apply_runtime_phy_cfg(eth, phy_addr)`、
+  `airoha_eth_gdm4_link_up_config(eth, pcs, phy_addr)`。这样一份代码同时喂两个端口。
+- 新增 WAN 侧两个入口，与 GDM4 侧一一对应：
+  - `airoha_recovery_wan_prime()` ←→ `airoha_gdm4_recovery_prime()`
+  - `airoha_recovery_wan_ensure_ready()` ←→ `airoha_gdm4_ensure_ready()`
+- `probe` 里释放 `XPON_PHY_RST` / `XPON_MAC_RST`（**清**位即 deassert，
+  见 `drivers/reset/reset-airoha.c`：bank0 = RST_CTRL2 `0x830`，
+  `XPON_PHY_RST` = bit0；bank1 = RST_CTRL1 `0x834`，`XPON_MAC_RST` = bit31）。
+- WAN PCS 的初始化放到 **`airoha_eth_init()`**（`airoha_recovery_wan_prime()`），
+  不在 probe：判据 `airoha_recovery_wan_service_enabled()` 依赖 env `recovery_port`，
+  env 此时已加载。
+- 周期维护（`airoha_recovery_poll_link()`）里在 `airoha_recovery_accept_gdm4_rx()` 那道
+  提前 return **之前**插一次 `airoha_recovery_wan_ensure_ready()`，
+  否则 wan-only 模式（`recovery_port=wan`）下 GDM4 路径整段跳过，WAN PCS 就没人管了。
+
+**唯一不需要复用的东西是 GDM4 的 MBI 分片大小**（`airoha_eth_gdm4_set_frag_size()`）：
+它是 GDM4 独有的，所以 `airoha_eth_gdm4_link_up_config()` 里用
+`if (pcs == &eth->pcs && speed)` 把它钉在 lan2 实例上。
+
+### 12.3 现场核对（零刷机）
+
+`rtl8261_diag` 的 WAN 字段扩充为（在原来 `serve`/`link` 之后）：
+
+```
+wan[serve=.. link=.. ready=.. pcslink=.. usx=.. rx=.. xfi[gib=.. rst=..] pcs[4=.. 310=..]]
+```
+
+auto/dual 模式下，PC 插 WAN 口后期望：
+
+| 字段 | 期望 | 含义 |
+|---|---|---|
+| `wan[serve=1]` | 1 | WAN 在恢复服务范围内 |
+| `ready=1` | 1 | `wan_pcs` 已被 `airoha_eth_gdm4_pcs_init()` 初始化过 |
+| `pcslink=1` / `usx=1` | 1 | WAN 侧 USXGMII PCS 上行、AN 完成 —— **这是本轮的关键判据** |
+| `rx=1` | 1 | WAN 侧 PMA 收到 RX 信号 |
+| `gdm2[fwd=00000004]` | PPE1 | GDM2 入向转发到 PPE1（§10） |
+| 串口 | `DHCP: DISCOVER … (rx fport 2)` | 帧真的穿过 serdes 到了 FE |
+
+修好后 `wan[pcslink=..]`/`rx=..` 应该从 0 变 1；若仍为 0 而 `link=1`，
+说明缺的是 XPON 复位释放或 PCS 基址（对照 §12.1 的表）。
+
+### 12.4 验证状态
+
+- 本机**无 aarch64 交叉工具链**：C 改动只做了静态审查（括号配平、printf 参数个数、
+  调用点签名逐一核对）+ CI 编译验证。
+- 待真机：按 §12.3 的判据逐项确认；同一套代码两个机型（`xr1710g` / `xg2010g`）共用。
 

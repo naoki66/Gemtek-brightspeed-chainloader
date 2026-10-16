@@ -141,8 +141,11 @@ recovery_size_uboot=0x100000
 - 恢复模式 DHCP 池默认 `192.168.0.2 – 192.168.0.50`（首个客户端仍拿 `.2` 以兼容旧文档）；
   可用 env `recovery_dhcp_start` / `recovery_dhcp_end` 放宽。
 - `recovery_port` 决定只在哪些口回 DHCP（安全需求，保留）：`wan`→fport 2、
-  `10g/lan1/4`→fport 4、`1g/lan2/lan3/1`→fport 1、`auto`→1 或 4。
+  `10g/lan1/4`→fport 4、`1g/lan2/lan3/1`→fport 1、`auto`（默认）→1、4 **和 2**。
   被端口策略丢弃的包现在会限流打印日志（不再静默）。
+- WAN 口（GDM2 + RTL8261 PHY8）走的是**另一份** USXGMII PCS（XPON serdes，
+  `pcs-handle = &pon_pcs`），U-Boot 里已按 lan2 的流程一并拉起；
+  细节见 `BOOT-AND-RECOVERY-OPTIMIZATION.md` §10 / §12。
 
 ---
 
@@ -167,6 +170,10 @@ recovery_size_uboot=0x100000
 - **客户端长时间拿不到 IP（需手动设 IP）**：历史上是“单一固定地址 + 一律 NAK”所致，
   现已改为按 MAC 的租约表；若仍拿不到，先排查 `recovery_port` 是否被设成 `lan1`/`10g`
   而 PC 实际插在 1G 口。手动设 IP 时应避开地址池（例如 `192.168.0.100`）。
+- **WAN 口能协商速率、网卡灯闪，但客户端拿不到 IP，串口也没有后续日志**：
+  WAN 的 serdes 是 XPON 块里的另一个 USXGMII PCS 实例，早期 U-Boot 只初始化了 lan2 的那一个，
+  所以 GDM2 一帧都发不出。现已把 lan2 的 PCS bring-up 参数化后复用给 WAN
+  （`BOOT-AND-RECOVERY-OPTIMIZATION.md` §12）。逐项判据见该节 §12.3。
 - **本机没有 aarch64 交叉工具链，所有 C 改动未经编译验证**：请在 CI / 有工具链的环境构建
   （详见 §7 已知限制）。
 
