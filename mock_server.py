@@ -10,28 +10,35 @@ HTDOCS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'lib', 'lw
 
 MOCK_UBOOT_VERSION = "U-Boot XR1710G-2026-8-10-gfc5d785865fb (Aug 10 2026 - local preview)"
 MOCK_RECOVERY_VERSION = "2026-8-8"
-MOCK_CREDIT = "Thanks to YYH2913"
+MOCK_CREDIT = "Gemtek-brightspeed-chainloader"
 MOCK_DETECTED_LAYOUT = "2.0"
 
-# Mirrors what /api/storage reports on real hardware: the three raw partitions
-# plus the volumes inside the active UBI layout.
+# Mirrors what /api/storage reports on real hardware: the raw MTD devices of
+# the XR1710G 512 MiB SPI-NAND.  mtd_for_each_device() yields the chip itself
+# first (ofs 0, parent == NULL) and then its six DT partitions.  UBI volumes
+# are deliberately absent - they live inside "system", and a volume dump is
+# not something the write path can put back, so the page no longer offers it.
 MOCK_STORAGE_TARGETS = [
-    {"kind": "mtd", "name": "vendor", "size": 0x00600000},
-    {"kind": "mtd", "name": "chainloader", "size": 0x00100000},
-    {"kind": "mtd", "name": "ubi", "size": 0x1b700000},
-    {"kind": "ubi", "name": "fit", "size": 22 * 1024 * 1024},
-    {"kind": "ubi", "name": "factory", "size": 0x6006},
-    {"kind": "ubi", "name": "rootfs_data", "size": 48 * 1024 * 1024},
-    {"kind": "ubi", "name": "ubootenv", "size": 0x1f000},
-    {"kind": "ubi", "name": "ubootenv2", "size": 0x1f000},
+    {"kind": "mtd", "name": "spi-nand0", "size": 0x20000000, "ofs": 0x00000000},
+    {"kind": "mtd", "name": "bootloader", "size": 0x00200000, "ofs": 0x00000000},
+    {"kind": "mtd", "name": "uenv", "size": 0x00200000, "ofs": 0x00200000},
+    {"kind": "mtd", "name": "dsd", "size": 0x00200000, "ofs": 0x00400000},
+    {"kind": "mtd", "name": "chainloader", "size": 0x00100000, "ofs": 0x00600000},
+    {"kind": "mtd", "name": "system", "size": 0x1b700000, "ofs": 0x00700000},
+    {"kind": "mtd", "name": "reserved_bmt", "size": 0x04200000, "ofs": 0x1be00000},
 ]
-MOCK_BACKUP_SIZE = max(x['size'] for x in MOCK_STORAGE_TARGETS)
+MOCK_SEGMENT = 256 * 1024
 _backup_seq = [1000]
+_armed = {"id": 0, "name": None, "size": 0}
 
 
 def next_backup_id():
     _backup_seq[0] += 1
     return _backup_seq[0]
+
+
+def find_target(name):
+    return next((x for x in MOCK_STORAGE_TARGETS if x['name'] == name), None)
 
 prog_phase = 0
 prog_done = 0
@@ -145,18 +152,17 @@ class RecoveryHandler(http.server.BaseHTTPRequestHandler):
         if path.startswith('/api/backup/'):
             spec = path[len('/api/backup/'):]
             kind, _, name = spec.partition('/')
-            if kind not in ('mtd', 'ubi') or not name:
+            if kind != 'mtd' or not name:
                 self.send_error(404)
                 return
-            entry = next((x for x in MOCK_STORAGE_TARGETS
-                          if x['kind'] == kind and x['name'] == name), None)
+            entry = find_target(name)
             if not entry:
                 self.send_json({"error": "cannot backup '%s'" % name, "code": -19})
                 return
-            backup_id = next_backup_id()
+            _armed.update(id=next_backup_id(), name=name, size=entry['size'])
             self.send_json({
-                "id": backup_id,
-                "kind": kind,
+                "id": _armed['id'],
+                "kind": "mtd",
                 "name": name,
                 "size": entry['size']
             })
@@ -169,7 +175,8 @@ class RecoveryHandler(http.server.BaseHTTPRequestHandler):
                 self.send_error(404)
                 return
             _id, offset, length = (int(p) for p in parts)
-            if length <= 0 or offset + length > MOCK_BACKUP_SIZE:
+            if (_id != _armed['id'] or length <= 0 or length > MOCK_SEGMENT or
+                    offset + length > _armed['size']):
                 self.send_error(400)
                 return
             body = bytes((offset + i) & 0xFF for i in range(length))
@@ -246,6 +253,48 @@ class RecoveryHandler(http.server.BaseHTTPRequestHandler):
             t.start()
             return
 
+        if path == '/upload/partition':
+            names = query.get('name', [])
+            name = names[0] if names else ''
+            entry = find_target(name)
+
+            def reject(reason):
+                # Drain the body first: answering before the client has
+                # finished sending resets the connection and the browser
+                # reports a network error instead of the 400 (the device
+                # firmware reads the body before it validates too).
+                if content_length > 0:
+                    self.rfile.read(content_length)
+                print(f"[mock] partition write rejected: {reason}")
+                self.send_response(400)
+                self.send_header('Content-Length', '0')
+                self.send_header('Connection', 'close')
+                self.end_headers()
+
+            if not entry:
+                reject(f"unknown target {name!r}")
+                return
+            if content_length <= 0 or content_length > entry['size']:
+                reject(f"{content_length} bytes does not fit in {name} "
+                       f"({entry['size']} bytes)")
+                return
+
+            self.rfile.read(content_length)
+            print(f"[mock] partition write: {content_length} bytes -> {name}")
+
+            reset_progress()
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/plain')
+            self.send_header('Content-Length', '2')
+            self.end_headers()
+            self.wfile.write(b'OK')
+
+            t = threading.Thread(target=simulate_flash,
+                                 args=('partition', name, content_length))
+            t.daemon = True
+            t.start()
+            return
+
         if path.startswith('/upload/uboot'):
             if content_length > 1 * 1024 * 1024:
                 print(f"[mock] content_len {content_length} exceeds max for uboot")
@@ -303,11 +352,12 @@ def main():
     print(f"XR1710G Recovery Mock Server running at http://127.0.0.1:{port}")
     print(f"  - GET  /about    -> version info")
     print(f"  - GET  /status   -> progress status")
-    print(f"  - GET  /api/storage          -> backup target list")
+    print(f"  - GET  /api/storage          -> MTD partition list")
     print(f"  - GET  /api/backup/mtd/<n>   -> arm a backup")
     print(f"  - GET  /api/download/<id>/<off>/<len>")
     print(f"  - POST /upload/firmware?layout=2.0")
     print(f"  - POST /upload/uboot")
+    print(f"  - POST /upload/partition?name=<partition>")
     print(f"  - POST /reboot")
     print()
     try:
