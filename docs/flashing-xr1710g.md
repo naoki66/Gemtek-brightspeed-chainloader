@@ -233,3 +233,74 @@ reset
   4. 从 U-Boot 反向验证收发：`ping 192.168.0.10`（先把电脑设成该静态地址）。能通就说明
      IP/TX/RX 都正常，问题只在 DHCP 回复。
      *Validate TX/RX from U-Boot with `ping 192.168.0.10`.*
+
+## 7. 恢复原厂 `uenv` 分区 / Restoring the vendor `uenv` partition
+
+> **刷机前请务必备份 `mtd1/uenv`（2 MiB 整分区）**：这是原厂 U-Boot 的 env 分区，同时也被
+> chainloader 读取（见 FAQ）。备份方式见 [5. 与 uboot-an758x 的区别] 中的 Linux 侧 `dd | tftp` 用法，
+> 或直接在 chainloader 下 `mtd read uenv <addr> 0 0x200000` 后 `tftp` 上传。
+> *Always back up the whole 2 MiB `uenv` partition before flashing.*
+
+XR1710G 的 `uenv` 分区布局（来自原厂备份，整分区 2 MiB）：
+
+| 偏移 / Offset | 大小 / Size | 内容 / Content |
+|---|---|---|
+| `0x000000` | `0x4000` | U-Boot 环境块：`u32 CRC32`（**小端**）+ NUL 分隔的 `key=value`，CRC 覆盖后 `0x3FFC` 字节 |
+| `0x004000` | `0x1C000` | `0xFF`（未使用） |
+| `0x020000` | `0x1E0000` | 全 `0x00`（原厂未使用区，恢复时会一并写回） |
+
+原厂环境关键项 / *key factory variables*：`bootcmd=flash imgread 2048;bootm`、
+`loadaddr=0x81800000`、`bootdelay=4`、`fdt_high=0xac000000`、`root=/dev/mtdblock4 ro`、
+`ubi.mtd=system`、`serverip=192.168.0.205`、`ipaddr=192.168.0.1`。
+
+### 7.1 在 chainloader（二级 U-Boot）下恢复 / From the chainloader prompt
+
+电脑网卡设静态 `192.168.0.10/24`，TFTP 服务器根目录放 `01_env_data.bin`：
+
+```sh
+setenv serverip 192.168.0.10
+setenv ipaddr 192.168.0.1
+tftpboot 0x90000000 01_env_data.bin
+mtd list                                    # 确认 uenv 分区存在
+mtd erase uenv 0 0x200000
+mtd write uenv 0x90000000 0 0x200000
+```
+
+### 7.2 在原厂 U-Boot（`ECNT>`）下恢复 / From the vendor prompt
+
+```sh
+ECNT> setenv serverip 192.168.0.10
+ECNT> setenv ipaddr 192.168.0.1
+ECNT> tftpboot 0x90000000 01_env_data.bin
+ECNT> flash erase 0x200000 0x200000
+ECNT> flash write 0x200000 0x200000 0x90000000
+ECNT> reset
+```
+
+若原厂 `flash write` 不接受一次 2 MiB，按 0x80000 分四次写：
+*If a single 2 MiB write is refused, split it into four 0x80000 chunks:*
+
+```sh
+ECNT> flash erase 0x200000 0x200000
+ECNT> flash write 0x200000 0x80000 0x90000000
+ECNT> flash write 0x280000 0x80000 0x90080000
+ECNT> flash write 0x300000 0x80000 0x90100000
+ECNT> flash write 0x380000 0x80000 0x90180000
+```
+
+### 7.3 恢复后 / After restoring
+
+1. 在原厂提示符核对：`printenv bootcmd` 应为 `flash imgread 2048;bootm`，
+   `printenv fdt_high`=`0xac000000`，`printenv bootdelay`=`4`。
+   *Verify with `printenv` at the vendor prompt.*
+2. `reset`。若 chainloader 未自动启动（原厂配方读的是原厂固件镜像），照 3.5 节重新设置引导配方：
+
+   ```sh
+   ECNT> setenv bootcmd 'flash read 0x600000 0x100000 0x81800000; bootm 0x81800000'
+   ECNT> saveenv
+   ECNT> reset
+   ```
+
+   **这次 `saveenv` 之后不会再被 chainloader 覆盖**：链式 U-Boot 已不再调用 `env_save()`
+   （见提交 `b3b4091`），`recovery_trigger` 改为对 env 块做单条目的裸读改写。
+   *This `saveenv` is safe now: the chainloader no longer rewrites the shared environment.*
