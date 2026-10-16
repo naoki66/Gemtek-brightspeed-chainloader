@@ -1728,12 +1728,62 @@ static unsigned long recovery_target_size_cap(enum upload_target tgt)
 	return size_cap;
 }
 
+/* Is there an MTD partition (or device) with exactly this name? */
+static bool recovery_mtd_part_exists(const char *name)
+{
+	struct mtd_info *mtd;
+
+	if (!name || !*name)
+		return false;
+
+	mtd = get_mtd_device_nm(name);
+	if (IS_ERR_OR_NULL(mtd))
+		return false;
+
+	put_mtd_device(mtd);
+
+	return true;
+}
+
+/*
+ * Pick the MTD partition that carries the UBI volume.
+ *
+ * A UBI layout version names that partition, but the labels come from the
+ * vendor tree ("ubi", "ubi1.5", "ubi1.0").  The board DT in this tree labels
+ * the 439 MiB UBI partition "system" instead - the same name that
+ * boot_ubi=ubi part system, recovery_ubi_part and the DT's compatible =
+ * "linux,ubi" node all use.  Resolve it in this order:
+ *
+ *   1. recovery_ubi_part from the environment (the board's own truth),
+ *   2. the layout label, when such an MTD partition really is in the DT,
+ *   3. the layout label unchanged (legacy behaviour).
+ *
+ * Getting this wrong is fatal and silent: recovery_resolve_target() returns
+ * -ENODEV, recovery_calc_target_max() then reports 0, and httpd_post_begin()
+ * falls back to RECOVERY_UPLOAD_MAX, so a 32 MiB-and-larger sysupgrade image
+ * is refused before a single byte of it is read.
+ */
 static const char *recovery_ubi_part(enum upload_target tgt)
 {
 	const char *part;
 
-	if (tgt == TARGET_FIRMWARE && current_ubi_layout)
-		return current_ubi_layout->part;
+	if (tgt == TARGET_FIRMWARE && current_ubi_layout) {
+		const char *want = current_ubi_layout->part;
+		const char *env_part = env_get("recovery_ubi_part");
+
+		if (env_part && *env_part) {
+			if (strcmp(env_part, want))
+				printf("ubi: layout %s names MTD '%s'; using '%s'\n",
+				       current_ubi_layout->version, want, env_part);
+			return env_part;
+		}
+
+		if (!recovery_mtd_part_exists(want))
+			printf("ubi: no MTD '%s' in this DT for layout %s\n",
+			       want, current_ubi_layout->version);
+
+		return want;
+	}
 
 	switch (tgt) {
 	case TARGET_UBOOT:
@@ -1748,7 +1798,7 @@ static const char *recovery_ubi_part(enum upload_target tgt)
 	if (!part)
 		part = env_get("recovery_ubi_part");
 
-	return part ?: "ubi";
+	return part ?: "system";
 }
 
 static int recovery_parse_ubi_layout(const char *uri)
@@ -3636,6 +3686,9 @@ err_t httpd_post_begin(void *connection, const char *uri, const char *http_reque
             } else {
                 printf("httpd: content_len %d exceeds allowed max %lu (target limit %lu, ofs 0x%llx)\n",
                        content_len, max, dts_max, (unsigned long long)tmpofs);
+                if (!dts_max)
+                    printf("httpd: target %d did not resolve; check recovery_mtd/recovery_ubi_part\n",
+                           current_target);
             }
 	    strlcpy(response_uri, "/400.html", response_uri_len);
             return ERR_ARG;

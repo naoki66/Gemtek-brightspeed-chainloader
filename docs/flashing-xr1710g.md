@@ -209,6 +209,39 @@ reset
   no firmware is installed, so the chainloader falls back to web recovery by design. Upload the
   `*-sysupgrade.itb` (target `firmware`) as described in 3.6.*
 
+- **上传固件时页面弹 `网络错误`（“镜像尚未发送，上传连接已失败”），串口打印
+  `httpd: content_len 57266486 exceeds allowed max 33554432 (target limit 0, ...)`：**
+  固件目标没有解析成功。`recovery_ubi_part()` 在 `firmware` 目标下**只**返回镜像布局表里的
+  分区标签 `ubi`，不读环境变量；而本板设备树把承载 UBI 的分区标注为 **`system`**
+  （`xr1710g.dts` / `xg2010g.dts` 的 `label = "system"` + `compatible = "linux,ubi"`，
+  与 `boot_ubi=ubi part system`、`recovery_ubi_part=system` 一致）。
+  于是 `recovery_resolve_target()` 返回 `-ENODEV`、`recovery_calc_target_max()` 报 0，
+  上传上限回落到默认 `RECOVERY_UPLOAD_MAX` = **32 MiB**，任何真实 sysupgrade 镜像
+  （本机约 54.6 MiB）在收到第一个字节之前就被拒绝。
+  *The firmware target never resolves: for it `recovery_ubi_part()` returns only the layout
+  label `ubi`, never the environment, while the board DT labels the UBI partition `system`.
+  Resolution therefore fails, the upload cap falls back to the 32 MiB default and any real
+  sysupgrade image is refused before its first byte.*
+
+  为什么表现成“网络错误”而不是“已拒绝”：服务端答 `/400.html` 时浏览器还在推 57 MB 请求体，
+  连接随即被关闭，XHR 先触发 `error` 且 `uploadSent` 仍为 `false`，页面于是显示
+  `网络错误 / 镜像尚未发送`。
+  *It surfaces as a network error rather than a rejection because the 57 MB body is still being
+  pushed when the server answers /400.html and closes, so XHR errors out with nothing marked sent.*
+
+  自检（修复后串口应出现）：
+  *Self-check — after the fix the console shows:*
+
+  ```text
+  ubi: layout 2.0 names MTD 'ubi'; using 'system'
+  httpd: accepting 57266486-byte firmware for UBI 2.0
+  ```
+
+  > 本板 DTB 只有 439 MiB 的 `system` 分区（即布局 **2.0**）。选 1.5 / 1.0 时若设备树里没有
+  > `ubi1.5` / `ubi1.0` 分区，会回落到 `system` 并打印提示 —— 这两个布局需要配套的 DTB 才有意义。
+  > *This DT only has the 439 MiB `system` partition (layout 2.0). Selecting 1.5/1.0 without a
+  > matching DTB falls back to `system` and says so.*
+
 - **电脑一直拿不到 IP（串口反复打印 `DHCP: DISCOVER` / `DHCP: sent OFFER`）：**
   服务端已经发出 OFFER，但客户端没收下，属于**链路/端口**问题而不是 DHCP 协议问题。按顺序排查：
   *The server does send the OFFER but the client never takes it — a link/port problem rather than a
