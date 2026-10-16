@@ -771,6 +771,7 @@ static void airoha_recovery_copy_head(u8 *dst, u8 *dst_len,
 }
 
 static bool airoha_rtl8261_is_phy_addr(int phy_addr);
+static int airoha_mdio_link_up(struct airoha_eth *eth, int addr);
 
 enum {
 	FE_PSE_PORT_CDM1,
@@ -1683,6 +1684,25 @@ static bool airoha_recovery_dual_service_enabled(void)
 	       !strcmp(port, "both") || !strcmp(port, "dual");
 }
 
+/*
+ * Is the WAN port (GDM2, RTL8261 PHY8) part of the recovery service?
+ *
+ * Pinning recovery_port to a front port ("1g"/"lan2"/"lan3" or "10g"/"lan1")
+ * or to "wan" means "only that port", and only that port is served.  The
+ * auto/dual default serves every socket a host can be plugged into, and the
+ * WAN socket is one of them, so a PC on the WAN port gets an address and the
+ * recovery page exactly like a PC on lan2/lan3 or the 10G port.
+ *
+ * This is the single switch that replaces the previous blanket exclusion of
+ * the WAN port.  Force a front port to keep the WAN side out of the recovery
+ * datapath (PHY8 is then powered down and its traffic dropped).
+ */
+static bool airoha_recovery_wan_service_enabled(void)
+{
+	return airoha_recovery_port_is_wan() ||
+	       airoha_recovery_dual_service_enabled();
+}
+
 bool airoha_recovery_dhcp_rx_allowed(struct udevice *dev)
 {
 	struct airoha_eth *eth;
@@ -1701,8 +1721,18 @@ bool airoha_recovery_dhcp_rx_allowed(struct udevice *dev)
 	if (airoha_recovery_port_is_1g())
 		return eth->last_rx_fport == 1;
 
-	/* Auto, dual and unknown modes never accept DHCP from the WAN port. */
-	return eth->last_rx_fport == 1 || eth->last_rx_fport == 4;
+	/*
+	 * Auto/dual: serve every socket a host can be plugged into.  A request
+	 * arriving on the WAN port is not a stray packet to be filtered, it is
+	 * a client that wants an address, so the WAN socket is accepted
+	 * whenever it is served as a recovery port.  Force a specific front
+	 * port to keep the WAN side out of the exchange.
+	 */
+	if (eth->last_rx_fport == 1 || eth->last_rx_fport == 4)
+		return true;
+
+	return airoha_recovery_wan_service_enabled() &&
+	       eth->last_rx_fport == 2;
 }
 
 /*
@@ -1891,14 +1921,18 @@ static bool airoha_gdm4_loopback_enabled(struct airoha_eth *eth)
 	bool loopback = false;
 
 	(void)eth;
-	if (airoha_recovery_port_is_wan())
+	if (airoha_recovery_wan_service_enabled())
 		return false;
 
 	/*
 	 * GDM2-to-GDM4 loopback is an optional 10G experiment. Keep it disabled
 	 * for normal recovery unless gdm4_loopback is explicitly enabled; the
 	 * CDM2/QDMA1 selection remains separately controlled by gdm4_cdm2.
-	 * An explicit WAN selection always owns GDM2 and overrides loopback.
+	 *
+	 * A serving WAN port always owns GDM2 and overrides loopback: the WAN
+	 * socket is a recovery port now, while loopback is an experiment that
+	 * repurposes the very same GDM2 block.  Force a front port
+	 * (e.g. recovery_port=lan2) to free GDM2 for the experiment.
 	 */
 	airoha_env_override_bool("gdm4_loopback", &loopback);
 
@@ -1910,7 +1944,7 @@ static u32 airoha_recovery_gdm2_fwd_port(struct airoha_eth *eth)
 	if (airoha_gdm4_loopback_enabled(eth))
 		return FE_PSE_PORT_GDM4;
 
-	return airoha_recovery_port_is_wan() ?
+	return airoha_recovery_wan_service_enabled() ?
 	       FE_PSE_PORT_PPE1 : FE_PSE_PORT_DROP;
 }
 
@@ -3494,11 +3528,13 @@ static void airoha_eth_gdm4_diag(struct airoha_eth *eth, const char *tag,
 	       an_mgbt_stat1, !!(an_mgbt_stat1 & BIT(13)),
 	       !!(an_mgbt_stat1 & BIT(12)), !!(an_mgbt_stat1 & BIT(11)),
 	       !!(an_mgbt_stat1 & BIT(6)), !!(an_mgbt_stat1 & BIT(5)));
-	printf("rtl8261: %s fe route ppe1_dft=%08x ppe2_dft=%08x sport24_map=%08x fc_map6=%08x use_cdm2=%d loopback=%d gdm4_fwd=%08x gdm4_src[new=%08x old=%08x] gdm2[fwd=%08x lpbk=%08x txch=%08x rxch=%08x] fport[def=%u tx=%u rx=%u] last_rx[v=%d qdma=%u sport=0x%x crsn=0x%x ppe=%u len=%u ctrl=%08x msg1=%08x]\n",
+	printf("rtl8261: %s fe route ppe1_dft=%08x ppe2_dft=%08x sport24_map=%08x fc_map6=%08x use_cdm2=%d loopback=%d gdm4_fwd=%08x gdm4_src[new=%08x old=%08x] gdm2[fwd=%08x lpbk=%08x txch=%08x rxch=%08x] wan[serve=%d link=%d] fport[def=%u tx=%u rx=%u] last_rx[v=%d qdma=%u sport=0x%x crsn=0x%x ppe=%u len=%u ctrl=%08x msg1=%08x]\n",
 	       tag ? tag : "diag", ppe1_route, ppe2_route, sp_cport, fc_map6,
 	       airoha_gdm4_use_cdm2(eth), airoha_gdm4_loopback_enabled(eth),
 	       gdm4_fwd, gdm4_src, gdm4_src_legacy, gdm2_fwd, gdm2_lpbk,
-	       gdm2_txch, gdm2_rxch, eth->default_tx_fport, eth->last_tx_fport,
+	       gdm2_txch, gdm2_rxch, airoha_recovery_wan_service_enabled(),
+	       airoha_mdio_link_up(eth, RTL8261_PHY8_ADDR),
+	       eth->default_tx_fport, eth->last_tx_fport,
 	       eth->last_rx_fport, eth->last_rx_valid, eth->last_rx_qdma,
 	       eth->last_rx_sport, eth->last_rx_crsn, eth->last_rx_ppe_entry,
 	       eth->last_rx_len, eth->last_rx_ctrl, eth->last_rx_msg1);
@@ -4425,7 +4461,7 @@ static void airoha_recovery_retry_pending_wakes(struct airoha_eth *eth, ulong no
 			       RTL8261_PHY5_ADDR, ret);
 	}
 	if (eth->rtl8261_phy8_wake_pending) {
-		if (!airoha_recovery_port_is_wan()) {
+		if (!airoha_recovery_wan_service_enabled()) {
 			eth->rtl8261_phy8_wake_pending = false;
 		} else {
 			ret = airoha_recovery_rtl8261_set_power(eth,
@@ -4559,17 +4595,24 @@ void airoha_recovery_restart_links(struct udevice *dev)
 	bool cycle_lan = airoha_recovery_port_is_1g() ||
 			 airoha_recovery_dual_service_enabled();
 	bool cycle_10g = airoha_recovery_accept_gdm4_rx();
-	bool cycle_wan = airoha_recovery_port_is_wan();
+	bool serve_wan = airoha_recovery_wan_service_enabled();
 	bool flap_links = airoha_recovery_link_flap_enabled();
 	bool lan_cycle = false;
 	ulong down_ms;
 	int ret;
 
-	if (!cycle_wan) {
-		/* Keep physical WAN traffic out of the recovery datapath. */
+	if (!serve_wan) {
+		/*
+		 * A front port was pinned: keep physical WAN traffic out of the
+		 * recovery datapath.
+		 */
 		airoha_recovery_power_down_wan_phy(eth);
 	} else if (!flap_links) {
-		/* A previous non-WAN recovery session may have left PHY8 down. */
+		/*
+		 * The WAN socket is a recovery port (wan, auto or dual), so PHY8
+		 * must be up: an earlier session that pinned a front port may
+		 * have left it powered down.
+		 */
 		eth->rtl8261_phy8_wake_pending = true;
 		ret = airoha_recovery_rtl8261_set_power(eth,
 							RTL8261_PHY8_ADDR, true);
@@ -4608,7 +4651,7 @@ void airoha_recovery_restart_links(struct udevice *dev)
 	 * power-up, so there is nothing to restart here.
 	 */
 
-	if (!cycle_lan && !cycle_10g && !cycle_wan)
+	if (!cycle_lan && !cycle_10g && !serve_wan)
 		return;
 
 	if (cycle_lan) {
@@ -5932,7 +5975,12 @@ static int airoha_eth_init(struct udevice *dev)
 	airoha_recovery_runtime_reset(eth);
 	/* Retry only RTL8261 PHYs whose earlier initialization did not finish. */
 	airoha_rtl8261_minimal_init(eth);
-	if (airoha_recovery_port_is_wan()) {
+	/*
+	 * The WAN PHY is brought up whenever the WAN socket is a recovery port
+	 * (wan, auto or dual), not only in the WAN-only mode: a previous session
+	 * that forced a front port leaves PHY8 powered down.
+	 */
+	if (airoha_recovery_wan_service_enabled()) {
 		ret = airoha_recovery_rtl8261_set_power(eth, RTL8261_PHY8_ADDR, true);
 		if (ret)
 			printf("airoha: PHY %d power-up failed: %d\n",
@@ -6134,7 +6182,7 @@ static int airoha_eth_send(struct udevice *dev, void *packet, int length)
 {
 	struct airoha_eth *eth = dev_get_priv(dev);
 	bool dual_service = airoha_recovery_dual_service_enabled();
-	bool send_lan = false, send_10g = false;
+	bool send_lan = false, send_10g = false, send_wan = false;
 	int attempts = 0, successes = 0;
 	int first_err = -EAGAIN;
 	u8 fport;
@@ -6167,9 +6215,17 @@ static int airoha_eth_send(struct udevice *dev, void *packet, int length)
 		 * Mirroring broadcasts to fport 1 is cheap and is required for
 		 * ARP/TFTP discovery. Send 10G broadcasts speculatively because
 		 * the GDM4/USXGMII link status can lag behind usable RX.
+		 *
+		 * The WAN port (GDM2) is a recovery port in auto/dual mode, so it
+		 * needs the same treatment: a DISCOVER arriving there is answered
+		 * with a broadcast OFFER, and a broadcast that is not mirrored to
+		 * fport 2 never reaches that client. Mirroring while the port is
+		 * idle costs one descriptor and is dropped by the MAC, and pinning
+		 * a front port is what keeps the WAN side out of the exchange.
 		 */
 		send_lan = true;
 		send_10g = airoha_recovery_accept_gdm4_rx();
+		send_wan = airoha_recovery_wan_service_enabled();
 		if (send_10g && airoha_recovery_gdm4_candidate(eth))
 			airoha_gdm4_ensure_ready(eth);
 
@@ -6185,6 +6241,15 @@ static int airoha_eth_send(struct udevice *dev, void *packet, int length)
 		if (send_10g) {
 			attempts++;
 			ret = airoha_eth_send_on_fport(dev, packet, length, 4);
+			if (!ret)
+				successes++;
+			else if (first_err == -EAGAIN)
+				first_err = ret;
+		}
+
+		if (send_wan) {
+			attempts++;
+			ret = airoha_eth_send_on_fport(dev, packet, length, 2);
 			if (!ret)
 				successes++;
 			else if (first_err == -EAGAIN)
