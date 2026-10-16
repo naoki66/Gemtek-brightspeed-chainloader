@@ -374,6 +374,11 @@ L2 单播**——目标为客户端自己的 MAC：
 单播帧会走 `airoha_pick_packet_tx_fport()` → 学到的 peer fport（= 1）→ `send_on_fport(…,1)`，
 正是与静态地址可访问相同的、已被证明可用的路径。
 
+**依赖配置**：`etharp_add_static_entry()`/`etharp_remove_static_entry()` 仅在
+`ETHARP_SUPPORT_STATIC_ENTRIES` 打开时存在，因此在
+`lib/lwip/u-boot/lwipopts.h` 增加 `#define ETHARP_SUPPORT_STATIC_ENTRIES 1`
+（该端口文件的 1 行改动，默认 `LWIP_DEBUG` 关闭故不会引入 ARP 调试刷屏）。
+
 ---
 
 ## 5. 体积与验证状态

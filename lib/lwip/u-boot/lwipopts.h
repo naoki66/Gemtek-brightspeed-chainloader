@@ -95,6 +95,14 @@
 #define LWIP_ARP                        1
 #define ARP_TABLE_SIZE                  4
 #define ARP_QUEUEING                    1
+/*
+ * The recovery DHCP server answers hosts that do not have an address yet, so
+ * it installs a temporary static entry (offered address -> client MAC) to
+ * unicast the reply, because the broadcast path does not reach a host on a
+ * recovery LAN port. etharp_add_static_entry()/etharp_remove_static_entry()
+ * only exist when this is enabled.
+ */
+#define ETHARP_SUPPORT_STATIC_ENTRIES   1
 
 #define IP_FORWARD                      0
 #define IP_OPTIONS_ALLOWED              1
