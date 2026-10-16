@@ -831,3 +831,61 @@ Windows 上永远复现不出来：`core.filemode` 默认 `false`，git 直接�
 `-dirty` 只影响**显示**：`cde417a`（§4.8/§4.9）之前发布的镜像内容本身没有问题，
 但横幅会一直写着 `-dirty`。要换掉它必须重刷一版 `9d4219f` 之后的镜像 ——
 正好可以和 §4.8/§4.9 的真机验证合并成一次刷机。
+
+## 10. WAN 口不再被排除在恢复之外（本轮）
+
+真机确认 §4.8/§4.9 修好（"所有口都能拿到 IP"）之后，把 WAN 口的屏蔽解除。
+
+### 10.1 屏蔽原来是四层
+
+| 层 | 位置 | 行为（auto/dual 模式） |
+|---|---|---|
+| DHCP 策略 | `airoha_recovery_dhcp_rx_allowed()` | 只认 fport 1/4，**直接拒绝 fport 2** |
+| PHY 电源 | `airoha_eth_init()` / `airoha_recovery_restart_links()` / `retry_pending_wakes()` | PHY8 只在上电 wan 模式时上电；否则**主动掉电**且丢弃唤醒请求 |
+| 转发 | `airoha_recovery_gdm2_fwd_port()` | 非 wan 模式返回 `FE_PSE_PORT_DROP`，GDM2 入向被丢 |
+| 发送 | `airoha_eth_send()` | 广播只镜像到 fport 1/4 → OFFER/ACK 到不了 WAN 客户端 |
+
+### 10.2 改法：单一判据，复用既有的 wan-only 通路
+
+新增 `airoha_recovery_wan_service_enabled()` = `recovery_port` 为 `wan` **或** auto/dual，
+替换上面四处零散的 `port_is_wan()` 判断。WAN 走的是 **wan-only 模式本来就存在的那条通路**
+（`gdm2_fwd → PPE1`；GDM2 的 PPE default CPU port 在非 loopback 分支里**无条件**设为 CDM1，
+见 `airoha_gdm4_update_cpu_path()`），所以这是"把已有实现放开到 auto/dual"，**没有新造数据通路**。
+
+`recovery_port` 语义现在是干净的：
+
+| `recovery_port` | 1G (lan2/lan3) | 10G (lan1) | WAN |
+|---|---|---|---|
+| 未设 / `auto` / `both` / `dual` | ✅ | ✅ | ✅ **（本轮新增）** |
+| `1` / `1g` / `lan2` / `lan3` | ✅ | ✗ | ✗（PHY8 掉电） |
+| `4` / `10g` / `lan1` | ✗ | ✅ | ✗（PHY8 掉电） |
+| `2` / `wan` | ✗ | ✗ | ✅ |
+
+另外 `airoha_gdm4_loopback_enabled()` 改为**在 WAN 被服务时返回 false**：
+WAN 服务优先于那个"把 GDM2 挪作 GDM4 用"的实验；要跑实验就 `recovery_port=lan2` 把 GDM2 让出来。
+
+### 10.3 ⚠️ 副作用与唯一开关
+
+恢复页**没有鉴权、且能刷固件**。WAN 口参与恢复后，接在上游网络里的设备也能访问
+`http://192.168.0.1/`（并且恢复服务器会把 `255.255.255.255:68` 的 OFFER/ACK 广播出去）。
+这正是原来屏蔽 WAN 的原因。
+
+**要把 WAN 挡在外面**：把 `recovery_port` 钉到前面板口，例如 `setenv recovery_port lan2`，
+然后 PHY8 掉电、GDM2 走 DROP、WAN 的 DHCP 请求被拒（与旧行为完全一致）。
+
+### 10.4 现场核对（零刷机）
+
+`rtl8261_diag` 新增 `wan[serve=.. link=..]` 字段（顺带给 `airoha_mdio_link_up()` 补了前置声明，
+它定义在该诊断函数之后）。auto 模式下期望：
+
+- `wan[serve=1 link=1]`（PC 插在 WAN 口且链路起来）
+- `gdm2[fwd=00000004]` —— 旧代码是 `0000000f`（DROP），这是 WAN 入向通不通的判据
+- WAN 口插 PC 后，串口应出现 `DHCP: DISCOVER from ... (rx fport 2)` 紧跟 `REQUEST`
+
+### 10.5 验证状态
+
+- CI run **38920168225**（`3216ceb`，§9 的 Makefile 改动）✅；
+  `1bd6c10`（本节）与 `d59b7f5`（删重复横幅）已提交，等待真机验证。
+- **未上机验证**：本机无 aarch64 交叉工具链，`driver` 改动只做了静态审查 +
+  `setlocalversion` 侧的本地实测。
+
