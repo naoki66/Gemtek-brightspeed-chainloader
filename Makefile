@@ -375,6 +375,18 @@ UBOOTRELEASE = $(shell cat include/config/uboot.release 2> /dev/null)
 UBOOTVERSION = XR1710G
 export VERSION PATCHLEVEL SUBLEVEL UBOOTRELEASE UBOOTVERSION
 
+# This tree never stamps the "-dirty" suffix into the version string.  The
+# string is compiled into the image and reaches the flash banner, the recovery
+# page's /api/about and the release title, where "dirty" is a rumour about
+# somebody's working copy rather than a fact about the release: every image is
+# built from a commit, and the CI builds only ever see a clean checkout (the
+# guard in .github/workflows/build.yml enforces that, and scripts/build.sh
+# warns when a local tree is dirty, so nothing is silently lost).
+#
+# Set UBOOT_KEEP_DIRTY=1 to get the upstream behaviour back for a scratch
+# build, e.g. UBOOT_KEEP_DIRTY=1 ./scripts/build.sh xr1710g.
+UBOOT_SETLOCALVERSION_FLAGS := $(if $(filter 1,$(UBOOT_KEEP_DIRTY)),,--no-dirty)
+
 # Modified for U-Boot
 -include $(srctree)/scripts/subarch.include
 
@@ -2220,8 +2232,11 @@ endif
 # The setlocalversion script comes from linux and expects a
 # KERNELVERSION variable in the environment for figuring out which
 # annotated tags are relevant. Pass UBOOTVERSION.
+#
+# UBOOT_SETLOCALVERSION_FLAGS carries --no-dirty by default: see the
+# explanation next to UBOOTVERSION above.
 define filechk_uboot.release
-	KERNELVERSION=$(UBOOTVERSION) LOCALVERSION="-$(shell date +%Y-%-m-%-d)" $(CONFIG_SHELL) $(srctree)/scripts/setlocalversion $(srctree)
+	KERNELVERSION=$(UBOOTVERSION) LOCALVERSION="-$(shell date +%Y-%-m-%-d)" $(CONFIG_SHELL) $(srctree)/scripts/setlocalversion $(UBOOT_SETLOCALVERSION_FLAGS) $(srctree)
 endef
 
 # Store (new) UBOOTRELEASE string in include/config/uboot.release

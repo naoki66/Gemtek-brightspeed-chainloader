@@ -16,6 +16,8 @@
 #   BUILD_ROOT      Per-board build directory (default: <repo>/build/<board>)
 #   OUTPUT_ROOT     Artifact directory        (default: <repo>/output/<board>)
 #   BUILD_JOBS      Parallel jobs            (default: nproc)
+#   UBOOT_KEEP_DIRTY  Set to 1 to append "-dirty" to the version string when
+#                     the tree has uncommitted changes (off by default).
 
 set -eu
 
@@ -51,6 +53,21 @@ mkdir -p "$build_root" "$output_root"
 
 echo "==> Building $board ($defconfig) with CROSS_COMPILE=$CROSS_COMPILE"
 cd "$repo_dir"
+
+# The version string never carries "-dirty" (see UBOOT_SETLOCALVERSION_FLAGS in
+# the Makefile), so this warning is the only thing standing between an
+# uncommitted edit and an image that quietly names a commit it does not match.
+# UBOOT_KEEP_DIRTY=1 brings the upstream suffix back instead.
+if [ "${UBOOT_KEEP_DIRTY:-}" != "1" ]; then
+	dirty="$(git --no-optional-locks status --porcelain --untracked-files=no 2>/dev/null || true)"
+	if [ -n "$dirty" ]; then
+		echo "warning: $board is being built from a tree with uncommitted changes:" >&2
+		echo "$dirty" >&2
+		echo "warning: the image will still report commit $(git rev-parse --short=12 HEAD) with no -dirty suffix." >&2
+		echo "warning: commit the change, or rebuild with UBOOT_KEEP_DIRTY=1 to mark it." >&2
+	fi
+fi
+
 make O="$build_root" "$defconfig"
 make O="$build_root" -j"$jobs" CROSS_COMPILE="$CROSS_COMPILE" "$@"
 

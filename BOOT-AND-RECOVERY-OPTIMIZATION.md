@@ -760,4 +760,74 @@ loadable）会就地解压，`kernel` 则延后到 `bootm_load_os()`；
   1. §4.8 / §4.9 的真机验证（上面 5 步）；
   2. `xg2010g_defconfig` 补齐 `BOOTDELAY=1` + `FASTMAP`（§2.3）；
   3. §7.4 压缩方案的真机验证；
-  4. §4.9 末尾的 PHY8（WAN）掉电隐患：确认 WAN 口在进过恢复模式后是否还连接。
+  4. §4.9 末尾的 PHY8（WAN）掉电隐患：确认 WAN 口在进过恢复模式后是否还连接；
+  5. §9.3 末尾：`UBOOTVERSION` 是全局常量 `XR1710G`，`XG2010G` 的版本串仍是
+     `XR1710G-recovery-…`，是否需要按机型分别生成。
+
+## 9. 版本号溯源：`-dirty` 标记已取消
+
+### 9.1 现象与根因
+
+自基线起，CI 产出的每个镜像横幅都是 `XR1710G-2026-10-16-g<commit>-dirty`，
+而 `git status` 在任何机器上都是干净的 —— 也就是说这个 `-dirty` 是**假情报**。
+
+根因是**权限位**，与代码无关：
+
+- `scripts/build.sh` 与 `chainloader/build-chainloader-fit.sh` 以 `100644` 提交；
+- `build.yml` 在跑 make **之前**执行 `chmod +x scripts/build.sh`；
+- 在 Linux 上这是一次**受版本跟踪的权限变更**（`100644 → 100755`），
+  `git status --porcelain` 因此报 `M scripts/build.sh`；
+- `make` 在**构建一开始**就由 `scripts/setlocalversion` 生成 `PLAIN_VERSION`，
+  它的 dirty 检查（脚本 152-157 行）看到任何受跟踪改动就追加 `-dirty`。
+
+Windows 上永远复现不出来：`core.filemode` 默认 `false`，git 直接忽略权限位。
+本地用 `git update-index --chmod=+x <file>` 改索引即可还原出 DIRTY 判定
+（`git status` / `git diff-index` 均报该文件，与 CI 现象一致）。
+
+### 9.2 修复（提交 `9d4219f`）
+
+1. 两个脚本的**可执行位写进索引并提交**（`mode change 100644 => 100755`）；
+2. 删掉 workflow 里的两处 `chmod +x`，并在原处留注释说明为什么不能再加回来；
+3. 新增守卫步骤 **Verify the work tree is clean before the version stamp**：
+   make 之前 `git status --porcelain --untracked-files=no` 非空即 CI 失败并打印改动文件，
+   让这类问题以"构建失败"而不是"版本号被污染"的形式暴露。
+
+### 9.3 再上一层保险：这个树不再产出 `-dirty`
+
+`-dirty` 描述的是"某个人的工作目录里有未提交改动"，而不是关于**已发布镜像**的事实，
+但镜像刷进设备后它会出现在串口横幅、恢复页 `/api/about` 和 Release 标题里。所以：
+
+- `Makefile`：新增
+  `UBOOT_SETLOCALVERSION_FLAGS := $(if $(filter 1,$(UBOOT_KEEP_DIRTY)),,--no-dirty)`，
+  传给 `filechk_uboot.release`。版本串保持
+  `<UBOOTVERSION>[-<CONFIG_LOCALVERSION>]-<构建日期>-g<12位commit>`。
+- `scripts/setlocalversion`：新增顶层 `--no-dirty`（上游只把它藏在 `scm_version`
+  内部，调用方够不着）；`-g<commit>` 与构建日期照常保留，溯源能力不减。
+- `scripts/build.sh`：树不干净时打**警告**并列出改动文件，提示
+  `UBOOT_KEEP_DIRTY=1` 可换回带标记的旧行为 —— 信息不丢，只是不再混进版本号。
+
+⚠️ `UBOOTVERSION = XR1710G` 是全局常量，所以 **XG2010G 的版本串是
+`XR1710G-recovery-…`**，机型只靠 `CONFIG_LOCALVERSION="-recovery"` 区分（既有行为）。
+
+### 9.4 实测
+
+本地（伪造 build 目录 + `CONFIG_LOCALVERSION_AUTO=y`，与 `filechk` 同一调用方式）：
+
+| 树状态 | 无 flag（旧行为） | `--no-dirty` |
+|---|---|---|
+| 干净 | `XR1710G-2026-10-16-gf448fc65021c` | 同左 |
+| 有改动 | `…-gf448fc65021c-dirty` | `…-gf448fc65021c` |
+
+端到端（CI run **38918803623**，提交 `9d4219f`，双 board job 均 success）：
+
+- `xr1710g-build-info.txt` → `XR1710G-2026-10-16-g9d4219ff0c5c`（**无 `-dirty`**）
+- `xg2010g-build-info.txt` → `XR1710G-recovery-2026-10-16-g9d4219ff0c5c`
+- slot 镜像内 `grep -a -- -dirty` = **0 处**；内嵌串只有
+  `XR1710G-2026-10-16-g9d4219ff0c5c`。产物 `1001298` 字节，与 §5.2 一致
+  （字符串短了 6 字节被 FIT 对齐吸收）。
+
+### 9.5 已经刷出去的镜像怎么办
+
+`-dirty` 只影响**显示**：`cde417a`（§4.8/§4.9）之前发布的镜像内容本身没有问题，
+但横幅会一直写着 `-dirty`。要换掉它必须重刷一版 `9d4219f` 之后的镜像 ——
+正好可以和 §4.8/§4.9 的真机验证合并成一次刷机。

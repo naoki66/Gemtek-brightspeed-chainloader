@@ -117,20 +117,21 @@ jobs:
 
       - name: Verify the work tree is clean before the version stamp
         run: |
-          # scripts/setlocalversion appends "-dirty" as soon as it sees any
-          # tracked modification, and make stamps the version at the very start
-          # of the build, so whatever dirt exists here ends up in PLAIN_VERSION
-          # and therefore in the flash banner and the release title.
+          # make stamps PLAIN_VERSION at the very start of the build, and this
+          # tree deliberately never appends a "-dirty" suffix (see
+          # UBOOT_SETLOCALVERSION_FLAGS in the Makefile).  A dirty tree would
+          # therefore ship an image whose banner and Release title name one
+          # exact commit while the binary contains something else -- a mislabel
+          # that nothing downstream can detect.  Fail here instead.
           #
           # The historic offender was an exec bit: the build used to chmod +x
-          # its own helper scripts, which is a tracked mode change on Linux and
-          # silently branded every image "-dirty".  The exec bits are committed
-          # now, so this check should stay green -- if it ever fails, fix the
-          # cause instead of relaxing the check.
+          # its own helper scripts, which is a tracked mode change on Linux.
+          # The modes are committed now, so this check should stay green -- if
+          # it ever fails, fix the cause rather than relaxing the check.
           DIRTY=$(git --no-optional-locks status --porcelain --untracked-files=no)
           if [ -n "$DIRTY" ]; then
             echo "$DIRTY"
-            echo "::error::work tree is dirty before the build; PLAIN_VERSION would be stamped '<version>-dirty'."
+            echo "::error::work tree is dirty before the build; the image would name a commit it does not match."
             exit 1
           fi
           echo "work tree clean before the version stamp"
