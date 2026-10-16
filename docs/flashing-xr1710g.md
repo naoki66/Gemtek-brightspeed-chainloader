@@ -211,8 +211,8 @@ reset
 
 - **上传固件时页面弹 `网络错误`（“镜像尚未发送，上传连接已失败”），串口打印
   `httpd: content_len 57266486 exceeds allowed max 33554432 (target limit 0, ...)`：**
-  固件目标没有解析成功。`recovery_ubi_part()` 在 `firmware` 目标下**只**返回镜像布局表里的
-  分区标签 `ubi`，不读环境变量；而本板设备树把承载 UBI 的分区标注为 **`system`**
+  固件目标没有解析成功（旧版本）。`recovery_ubi_part()` 在 `firmware` 目标下**只**返回镜像布局表里
+  的分区标签（当时是 `ubi`），不读环境变量；而本板设备树把承载 UBI 的分区标注为 **`system`**
   （`xr1710g.dts` / `xg2010g.dts` 的 `label = "system"` + `compatible = "linux,ubi"`，
   与 `boot_ubi=ubi part system`、`recovery_ubi_part=system` 一致）。
   于是 `recovery_resolve_target()` 返回 `-ENODEV`、`recovery_calc_target_max()` 报 0，
@@ -233,14 +233,15 @@ reset
   *Self-check — after the fix the console shows:*
 
   ```text
-  ubi: layout 2.0 names MTD 'ubi'; using 'system'
   httpd: accepting 57266486-byte firmware for UBI 2.0
   ```
 
-  > 本板 DTB 只有 439 MiB 的 `system` 分区（即布局 **2.0**）。选 1.5 / 1.0 时若设备树里没有
-  > `ubi1.5` / `ubi1.0` 分区，会回落到 `system` 并打印提示 —— 这两个布局需要配套的 DTB 才有意义。
-  > *This DT only has the 439 MiB `system` partition (layout 2.0). Selecting 1.5/1.0 without a
-  > matching DTB falls back to `system` and says so.*
+  > **布局选择只剩 UBI 2.0。** 本板设备树只定义了 439 MiB 的 `system` 分区；早先的
+  > 1.5（473.75 MiB）/ 1.0（503 MiB）在设备树里没有对应分区，选了也只会回落到 `system`，
+  > 因此已从页面与代码中移除。默认值始终是 2.0，无需选择。
+  > *The layout selector now offers only UBI 2.0. This DT defines just the 439 MiB `system`
+  > partition; the 1.5/1.0 views had no matching partition and only ever fell back to `system`,
+  > so they were dropped from both the page and the code. 2.0 is always the default.*
 
 - **电脑一直拿不到 IP（串口反复打印 `DHCP: DISCOVER` / `DHCP: sent OFFER`）：**
   服务端已经发出 OFFER，但客户端没收下，属于**链路/端口**问题而不是 DHCP 协议问题。按顺序排查：

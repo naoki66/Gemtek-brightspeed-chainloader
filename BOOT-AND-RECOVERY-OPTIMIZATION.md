@@ -2,8 +2,13 @@
 
 对比对象：
 
-- 本项目 `XR1710G-http-uboot`（U-Boot 2026.07 分支，**chainloader 方案**，naoki66 fork of YYH2913）
+- 本项目（U-Boot 2026.07 分支，**chainloader 方案**）
 - `D:\GitData\uboot-an758x`（U-Boot v2026.10，**TF-A BL2/FIP 原生方案**）
+
+> **2026-10-16 更新**：UBI 布局已收敛为**单一 UBI 2.0**（439 MiB `system` 分区）。
+> 下文出现的 `ubi` / `ubi1.5` / `ubi1.0` 与"WebUI 多布局在线切换"均为**历史状态**：
+> 这两个视图在设备树里没有对应分区，选了只会回落到 `system`，已从页面与代码中移除。
+> 固件上传见 `docs/flashing-xr1710g.md` §6。
 
 ---
 

@@ -8,7 +8,7 @@ PREFIX_SHIM="$SCRIPT_DIR/chainloader-prefix-shim.uImage"
 SHIM="$SCRIPT_DIR/chainloader-shim.bin"
 # Each board ships its own control DTB and ITS template; pass the board name as
 # the 5th argument.  This repository is primarily XR1710G, so that is the
-# default (XG2010G-http-uboot already validated the same wrapper with its own
+# default (the XG2010G port already validated the same wrapper with its own
 # xg2010g-chainloader-control.dtb / .its.in).
 BOARD="${5:-xr1710g}"
 DTB="$SCRIPT_DIR/$BOARD-chainloader-control.dtb"

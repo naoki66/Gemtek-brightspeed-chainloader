@@ -333,7 +333,7 @@ jobs:
           </p>
 
           <p align="center">
-            <img src="https://github.com/naoki66/XR1710G-http-uboot/raw/${RELEASE_TAG}/c6ea388c976395326514814f80d512d5.png" alt="Donate" width="240">
+            <img src="https://github.com/naoki66/Gemtek-brightspeed-chainloader/raw/${RELEASE_TAG}/c6ea388c976395326514814f80d512d5.png" alt="Donate" width="240">
           </p>
           EOF
 
