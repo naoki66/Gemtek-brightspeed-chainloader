@@ -653,6 +653,7 @@ int board_late_init(void)
 	char boot_ubi[64];
 	const char *ubi_part;
 	const char *recovery_trigger;
+	const char *bootcmd;
 	ulong recovery_addr;
 
 	if (xr1710g_is_compatible())
@@ -664,6 +665,43 @@ int board_late_init(void)
 	snprintf(boot_ubi, sizeof(boot_ubi),
 		 "ubi part %s && run boot_production", ubi_part);
 	env_set("boot_ubi", boot_ubi);
+	/*
+	 * The persistent environment is stored in the stock "uenv" MTD
+	 * partition, so a board programmed with the TTL guide keeps the vendor
+	 * bootcmd ("flash read 0x600000 0x100000 $loadaddr; bootm").  'flash'
+	 * does not exist in this U-Boot; once it fails, the rest of the recipe
+	 * boots the chainloader prefix shim that is still sitting at loadaddr,
+	 * which re-enters the chainloader instead of the production FIT.  That
+	 * shim is additionally rejected by LMB because its load address
+	 * 0x80088000 falls inside the 0x80000000-0x80200000 ATF reservation.
+	 * Normalize only the known legacy recipes, preserve user commands.
+	 */
+	bootcmd = env_get("bootcmd");
+	if (!bootcmd || strstr(bootcmd, "flash ")) {
+		env_set("bootcmd", "run boot_ubi || http_recovery");
+		printf("XR1710G: normalized legacy bootcmd to direct UBI FIT\n");
+	}
+	if (!env_get("loadaddr"))
+		env_set("loadaddr", "0x81800000");
+	if (!env_get("bootconf"))
+		env_set("bootconf", "config-1");
+	/* A foreign environment also lacks the helper recipes boot_ubi calls. */
+	if (!env_get("ubi_read_production"))
+		env_set("ubi_read_production", "ubi read ${loadaddr} fit");
+	bootcmd = env_get("boot_production");
+	if (!bootcmd || strstr(bootcmd, "flash "))
+		env_set("boot_production",
+			"run ubi_read_production && bootm ${loadaddr}#${bootconf}");
+	/*
+	 * The vendor environment carries fdt_high from the stock boot flow.
+	 * That fixed ceiling forces the relocated DTB into a window that is
+	 * not suitable for this 64-bit U-Boot; let the LMB allocator choose a
+	 * reserved-safe address instead.
+	 */
+	if (env_get("fdt_high")) {
+		env_set("fdt_high", NULL);
+		printf("XR1710G: cleared legacy fdt_high override\n");
+	}
 	if (xr1710g_ubi_layout_available)
 		xr1710g_sync_factory_part(ubi_part);
 

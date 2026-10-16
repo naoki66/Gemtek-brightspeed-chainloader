@@ -142,3 +142,38 @@ reset
   *Wrong image file — use `xr1710g-chainloader-slot.bin`.*
 - **恢复页面打不开**：确认按住 reset 上电、电脑为 DHCP、访问 <http://192.168.0.1>。
   *Make sure recovery was entered, the PC uses DHCP, and the URL is http://192.168.0.1.*
+- **串口停在 `Unknown command 'flash'`，接着 `Unable to allocate memory 0x80088000`：**
+  教程把 `bootcmd` 写进了原厂 `uenv` 分区，而二级 chainloader U-Boot 读的是同一个分区，
+  于是沿用了原厂配方 `flash read 0x600000 0x100000 $loadaddr; bootm`。`flash` 命令在本 U-Boot 里
+  已不存在；失败后配方继续执行 `bootm`，boot 的正是仍留在 `loadaddr` 处的 chainloader 前缀 shim
+  —— 等于把自己再启动一遍（该地址又落在 ATF 预留区 0x80000000-0x80200000 内，被 LMB 拒绝）。
+  *The guide writes `bootcmd` into the stock `uenv` partition, which is also the env partition of
+  the second-stage chainloader U-Boot, so the vendor `flash read ...; bootm` recipe is inherited.
+  `flash` no longer exists; the recipe then boots the chainloader prefix shim still sitting at
+  `loadaddr`, i.e. itself — and that address lies inside the ATF reservation
+  0x80000000-0x80200000, which LMB rejects.*
+
+  现场修复（U-Boot 命令行，无需重新刷机）*Fix at the U-Boot prompt, no reflash needed:*
+
+  ```sh
+  env default -a
+  saveenv
+  reset
+  ```
+
+  或只改启动变量 *or only rewrite the boot variables:*
+
+  ```sh
+  setenv bootcmd 'run boot_ubi || http_recovery'
+  setenv boot_production 'run ubi_read_production && bootm ${loadaddr}#${bootconf}'
+  setenv ubi_read_production 'ubi read ${loadaddr} fit'
+  setenv loadaddr 0x81800000
+  setenv bootconf config-1
+  saveenv
+  reset
+  ```
+
+  现行 `board/airoha/an7581/xr1710g_rfb.c` 已内置同样的规范化逻辑（检测到含 `flash` 的旧配方即改写），
+  重新编译刷入后无需手工执行。
+  *`board/airoha/an7581/xr1710g_rfb.c` now performs the same normalization at boot, so a rebuilt
+  image does not need these commands.*
