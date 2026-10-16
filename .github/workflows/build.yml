@@ -3,12 +3,14 @@ name: Build AN7581 U-Boot (XR1710G / XG2010G)
 # Multi-board cloud build, modeled on the uboot-an758x CI layout:
 #   * a matrix over the supported boards
 #   * one shared build helper (scripts/build.sh) invoked per board
-#   * per-board artifacts + an optional GitHub Release
+#   * per-board artifacts, plus an optional GitHub Release
 #
 # This repository builds U-Boot only -- no TF-A / BL2 / FIP signing (the
-# recovery U-Boot is flashed through the existing chainloader). The XR1710G
-# board additionally packages a chainloader slot image, which is the artifact
-# actually flashed through HTTP Recovery.
+# recovery U-Boot is flashed through the existing chainloader).  Each board
+# additionally packages a chainloader slot image, which is the single artifact
+# released and the only file flashed through HTTP Recovery.  A bare .itb is
+# deliberately not produced any more: it must never be uploaded to the recovery
+# server, and a file that must not be used is a file that should not exist.
 
 on:
   push:
@@ -36,9 +38,33 @@ permissions:
   contents: read
 
 jobs:
+  # One wall-clock stamp shared by every asset of this run.  Computing it in
+  # the matrix job instead would give each board a slightly different time and
+  # make the release title depend on which job finished last.
+  stamp:
+    name: Resolve build stamp
+    runs-on: ubuntu-latest
+    outputs:
+      stamp: ${{ steps.now.outputs.stamp }}
+      release_date: ${{ steps.now.outputs.release_date }}
+    steps:
+      - name: Resolve build stamp
+        id: now
+        run: |
+          STAMP=$(date -u +%Y%m%d-%H%M%S)
+          # Derived with pure shell arithmetic: GNU/BSD date disagree about
+          # parsing "20261016-040544", and the tag must stay identical between
+          # this workflow and publish-existing-artifact.yml for the same run.
+          Y=${STAMP:0:4}
+          M=${STAMP:4:2}
+          D=${STAMP:6:2}
+          echo "stamp=$STAMP" >> "$GITHUB_OUTPUT"
+          echo "release_date=$Y-$((10#$M))-$((10#$D))" >> "$GITHUB_OUTPUT"
+
   build:
     name: Build ${{ matrix.target }}
     runs-on: ubuntu-latest
+    needs: stamp
     strategy:
       fail-fast: false
       matrix:
@@ -48,8 +74,9 @@ jobs:
     outputs:
       build_mode: ${{ steps.mode.outputs.value }}
       commit: ${{ steps.version.outputs.commit }}
-      release_date: ${{ steps.version.outputs.release_date }}
+      release_date: ${{ needs.stamp.outputs.release_date }}
       version: ${{ steps.version.outputs.version }}
+      stamp: ${{ needs.stamp.outputs.stamp }}
 
     steps:
       - name: Checkout
@@ -76,6 +103,18 @@ jobs:
           echo "value=$MODE" >> "$GITHUB_OUTPUT"
           echo "Build mode: $MODE"
 
+      - name: Verify embedded recovery page is current
+        run: |
+          # The recovery UI is compiled into the image from
+          # lib/lwip/httpd/htdocs/, so forgetting to regenerate it ships a
+          # device that serves an old page.  Regenerate and fail on any diff.
+          python3 lib/lwip/httpd/makefsdata.py \
+            lib/lwip/httpd/htdocs lib/lwip/httpd/fsdata_xr1710g.c
+          if ! git diff --exit-code -- lib/lwip/httpd/fsdata_xr1710g.c; then
+            echo "::error file=lib/lwip/httpd/fsdata_xr1710g.c::embedded recovery page is stale. Run: python3 lib/lwip/httpd/makefsdata.py lib/lwip/httpd/htdocs lib/lwip/httpd/fsdata_xr1710g.c and commit the result."
+            exit 1
+          fi
+
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -101,12 +140,13 @@ jobs:
       - name: Package chainloader slot (${{ matrix.target }})
         run: |
           chmod +x chainloader/build-chainloader-fit.sh
-          ./chainloader/build-chainloader-fit.sh \
-            "output/${{ matrix.target }}/u-boot.bin" \
-            out \
-            "build/${{ matrix.target }}/tools/mkimage" \
-            "build/${{ matrix.target }}/tools/dumpimage" \
-            "${{ matrix.target }}"
+          XG2010G_BUILD_STAMP="${{ needs.stamp.outputs.stamp }}" \
+            ./chainloader/build-chainloader-fit.sh \
+              "output/${{ matrix.target }}/u-boot.bin" \
+              out \
+              "build/${{ matrix.target }}/tools/mkimage" \
+              "build/${{ matrix.target }}/tools/dumpimage" \
+              "${{ matrix.target }}"
           ls -la out/
 
       - name: Get version info
@@ -123,30 +163,33 @@ jobs:
           echo "commit=${COMMIT_SHORT}" >> "$GITHUB_OUTPUT"
           echo "date=${DATE}" >> "$GITHUB_OUTPUT"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          RELEASE_DATE=$(date +%Y-%-m-%-d)
-          echo "release_date=${RELEASE_DATE}" >> "$GITHUB_OUTPUT"
 
       - name: Prepare artifacts (${{ matrix.target }})
         run: |
           mkdir -p build-output
-          # Publish exactly two files per board:
-          #   * <board>-chainloader-slot.bin — flash via HTTP Recovery `uboot` target
-          #   * <board>-chainloader.itb     — RAM-only TFTP validation, never upload
-          cp out/${{ matrix.target }}-chainloader-slot.bin \
-            "build-output/${{ matrix.target }}-chainloader-slot.bin"
-          cp out/${{ matrix.target }}-chainloader.itb \
-            "build-output/${{ matrix.target }}-chainloader.itb"
+          STAMP="${{ needs.stamp.outputs.stamp }}"
+          SLOT_NAME="${{ matrix.target }}-chainloader-${STAMP}-g${{ steps.version.outputs.commit }}-slot.bin"
+          if [ ! -f "out/$SLOT_NAME" ]; then
+            echo "::error::expected chainloader slot not found: out/$SLOT_NAME"
+            ls -la out/
+            exit 1
+          fi
+          # Exactly one deliverable per board: the versioned slot image.  The
+          # .txt files are the machine-readable build record and stay inside
+          # the Actions artifact instead of the public Release.
+          cp "out/$SLOT_NAME" "build-output/$SLOT_NAME"
           {
             echo "Build target: ${{ matrix.target }}"
-            echo "Build date: $(date)"
+            echo "Build date: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "Build stamp (UTC): ${STAMP}"
             echo "Commit: $(git rev-parse HEAD)"
             echo "Commit short: $(git rev-parse --short HEAD)"
             echo "Ref: ${GITHUB_REF_NAME}"
             echo "Build mode: ${{ steps.mode.outputs.value }}"
             echo "U-Boot version: ${{ steps.version.outputs.version }}"
+            echo "Flash slot image: ${SLOT_NAME}"
           } > "build-output/${{ matrix.target }}-build-info.txt"
-          sha256sum build-output/* > "build-output/${{ matrix.target }}-sha256sums.txt" \
-            2>/dev/null || true
+          (cd build-output && sha256sum "$SLOT_NAME" > "${{ matrix.target }}-sha256sums.txt")
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v7
@@ -172,28 +215,52 @@ jobs:
           path: release-output
           merge-multiple: true
 
+      - name: Select release assets
+        run: |
+          # Only the slot images become Release assets; the .txt build records
+          # stay in the Actions artifact.
+          shopt -s nullglob
+          mkdir -p release-assets
+          for f in release-output/*-chainloader-*-slot.bin; do
+            cp "$f" release-assets/
+          done
+          if [ -z "$(ls -A release-assets)" ]; then
+            echo "::error::no chainloader slot image found to release"
+            ls -la release-output/
+            exit 1
+          fi
+          ls -la release-assets/
+
       - name: Create or update GitHub Release
         env:
           GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_MODE: ${{ needs.build.outputs.build_mode }}
           RELEASE_TAG: ${{ needs.build.outputs.release_date }}-${{ needs.build.outputs.commit }}
-          RELEASE_TITLE: AN7581 U-Boot ${{ needs.build.outputs.version }}-${{ needs.build.outputs.release_date }}-g${{ needs.build.outputs.commit }}
+          RELEASE_TITLE: AN7581 U-Boot ${{ needs.build.outputs.version }}-${{ needs.build.outputs.stamp }}
         run: |
+          shopt -s nullglob
           NOTES_FILE=$(mktemp)
           {
             echo "Automated build from commit [\`${{ needs.build.outputs.commit }}\`](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA})."
             echo
             echo "**Release channel / 发布通道:** ${RELEASE_MODE}"
             echo
+            echo "| 版本号 Version | 构建时间 Build time (UTC) | Commit |"
+            echo "|---|---|---|"
+            echo "| \`${{ needs.build.outputs.version }}\` | \`${{ needs.build.outputs.stamp }}\` | \`${{ needs.build.outputs.commit }}\` |"
+            echo
             echo "## 文件说明 / Files"
             echo
-            echo "每个机型仅发布 2 个文件。Each board ships exactly two files:"
+            echo "每个机型只发布 1 个文件。Each board ships exactly one file:"
             echo
             echo "| 文件 File | 说明 Description |"
             echo "|---|---|"
-            echo "| \`xr1710g-chainloader-slot.bin\` / \`xg2010g-chainloader-slot.bin\` | 唯一用于刷机的镜像：通过 HTTP Recovery 的 \`uboot\` 目标写入 chainloader 分区（偏移 0x600000，1 MiB）。The only image to flash: write through the HTTP Recovery \`uboot\` target (offset 0x600000, 1 MiB). |"
-            echo "| \`xr1710g-chainloader.itb\` / \`xg2010g-chainloader.itb\` | 仅用于 TFTP RAM 验证启动，请勿通过 HTTP Recovery 上传。RAM-only validation through TFTP. Do not upload this file to HTTP Recovery. |"
+            for f in release-assets/*-slot.bin; do
+              echo "| \`$(basename "$f")\` | 唯一用于刷机的镜像：通过 HTTP Recovery 的 \`uboot\` 目标写入 chainloader 分区（偏移 0x600000，1 MiB）。The only image to flash: write it through the HTTP Recovery \`uboot\` target (offset 0x600000, 1 MiB). |"
+            done
+            echo
+            echo "文件名内嵌版本号与构建时间，不同构建之间不会混淆。The filename carries the version and the build time so two builds can never be confused."
             echo
             echo "刷机教程 / Flashing guide: [XR1710G](docs/flashing-xr1710g.md) · [XG2010G](docs/flashing-xg2010g.md)"
             echo
@@ -220,16 +287,16 @@ jobs:
                 --prerelease=false \
                 --latest
             fi
-            gh release upload "$RELEASE_TAG" release-output/* --clobber
+            gh release upload "$RELEASE_TAG" release-assets/* --clobber
           elif [ "$RELEASE_MODE" = "pre-release" ]; then
-            gh release create "$RELEASE_TAG" release-output/* \
+            gh release create "$RELEASE_TAG" release-assets/* \
               --target "$GITHUB_SHA" \
               --title "$RELEASE_TITLE" \
               --notes-file "$NOTES_FILE" \
               --prerelease \
               --latest=false
           else
-            gh release create "$RELEASE_TAG" release-output/* \
+            gh release create "$RELEASE_TAG" release-assets/* \
               --target "$GITHUB_SHA" \
               --title "$RELEASE_TITLE" \
               --notes-file "$NOTES_FILE" \

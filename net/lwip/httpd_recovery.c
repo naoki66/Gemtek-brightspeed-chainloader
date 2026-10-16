@@ -65,7 +65,7 @@ DECLARE_GLOBAL_DATA_PTR;
 #if defined(CONFIG_BOARD_XG2010G)
 #define BOARD_RELEASE_VERSION        XG2010G_RELEASE_VERSION
 #define BOARD_RELEASE_CREDIT         XG2010G_RELEASE_CREDIT
-#define BOARD_FLASH_SLOT_NAME        "xg2010g-chainloader-slot.bin"
+#define BOARD_FLASH_SLOT_NAME        "xg2010g-chainloader-*-slot.bin"
 int xg2010g_sync_factory(void);
 int xg2010g_sync_factory_part(const char *part);
 const char *xg2010g_detect_ubi_version(void);
@@ -77,7 +77,7 @@ const char *xg2010g_detect_ubi_part(void);
 #else
 #define BOARD_RELEASE_VERSION        XR1710G_RELEASE_VERSION
 #define BOARD_RELEASE_CREDIT         XR1710G_RELEASE_CREDIT
-#define BOARD_FLASH_SLOT_NAME        "xr1710g-chainloader-slot.bin"
+#define BOARD_FLASH_SLOT_NAME        "xr1710g-chainloader-*-slot.bin"
 int xr1710g_sync_factory(void);
 int xr1710g_sync_factory_part(const char *part);
 const char *xr1710g_detect_ubi_version(void);
@@ -173,6 +173,34 @@ const char *xr1710g_detect_ubi_part(void);
 #define RECOVERY_IH_MAGIC 0x27051956U
 #define RECOVERY_FDT_MAGIC 0xd00dfeedU
 
+/*
+ * Longest MTD partition name the page may ask about.  Only [A-Za-z0-9_.-] is
+ * accepted, which covers every partition on this board (bootloader, uenv,
+ * dsd, chainloader, system, reserved_bmt) and lets the value travel through
+ * JSON and a URL query string without escaping or percent-decoding.
+ */
+#define RECOVERY_PARTITION_NAME_LEN	32
+
+static bool recovery_partition_name_valid(const char *name)
+{
+	size_t i;
+
+	if (!name || !name[0] || strlen(name) >= RECOVERY_PARTITION_NAME_LEN)
+		return false;
+
+	for (i = 0; name[i]; i++) {
+		char c = name[i];
+
+		if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+		    (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.')
+			continue;
+
+		return false;
+	}
+
+	return true;
+}
+
 static u8 *recv_base;
 static u32 recv_off;
 static u32 recv_total;
@@ -249,18 +277,31 @@ static u32 recovery_be32_to_cpu(const void *p)
 enum upload_target {
 	TARGET_FIRMWARE = 0,
 	TARGET_UBOOT,
+	/*
+	 * Raw restore of one MTD partition named by the page.  Unlike the two
+	 * targets above this one is not driven by the environment: the page
+	 * sends back the exact name it listed from /api/storage.
+	 */
+	TARGET_PARTITION,
 };
 static enum upload_target current_target = TARGET_FIRMWARE;
+/* Partition named by the last /upload/partition request. */
+static char current_partition[RECOVERY_PARTITION_NAME_LEN];
 
 struct recovery_ubi_layout {
 	const char *version;
 	const char *part;
 };
 
+/*
+ * The only UBI view this board has.  The vendor tree also carried 1.5
+ * (473.75 MiB) and 1.0 (503 MiB) views, but no DT in this tree defines
+ * those partitions - only the 439 MiB 0x700000 partition, labelled
+ * "system", matching the engine's single layout - so offering them would
+ * just have rebuilt 2.0 under a different name.
+ */
 static const struct recovery_ubi_layout recovery_ubi_layouts[] = {
-	{ "2.0", "ubi" },
-	{ "1.5", "ubi1.5" },
-	{ "1.0", "ubi1.0" },
+	{ "2.0", "system" },
 };
 
 static const struct recovery_ubi_layout *current_ubi_layout =
@@ -1339,7 +1380,8 @@ static void recovery_dhcp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
 		ip4_addr_t preferred;
 		u32 want = 0;
 
-		printf("DHCP: DISCOVER from %pM\n", req->chaddr);
+		printf("DHCP: DISCOVER from %pM (rx fport %d)\n", req->chaddr,
+		       airoha_recovery_last_rx_fport(srv->netif->state));
 		recovery_dhcp_expire_leases(srv);
 
 		if (!recovery_dhcp_get_ip4_option(pkt, pkt_len,
@@ -1364,16 +1406,42 @@ static void recovery_dhcp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
 		struct recovery_dhcp_lease *lease;
 		bool nak = false;
 
-		printf("DHCP: REQUEST from %pM\n", req->chaddr);
+		printf("DHCP: REQUEST from %pM (rx fport %d)\n", req->chaddr,
+		       airoha_recovery_last_rx_fport(srv->netif->state));
 		recovery_dhcp_expire_leases(srv);
 
 		lease = recovery_dhcp_resolve_request(srv, req, pkt, pkt_len,
 						      &nak);
-		if (lease)
+		if (lease) {
 			recovery_dhcp_send_reply(srv, req, DHCP_ACK,
 						 &lease->addr);
-		else if (nak)
+		} else if (nak) {
+			/*
+			 * Almost always a host that still remembers a lease
+			 * from another network (e.g. 192.168.1.x): it asks for
+			 * an address we do not own, so push it back to
+			 * DISCOVER. Say what it asked for - without this a
+			 * stale-address NAK is indistinguishable from a
+			 * pool-exhausted one in the field log.
+			 */
+			ip4_addr_t wanted;
+			char wanted_str[IP4ADDR_STRLEN_MAX];
+
+			if (!recovery_dhcp_get_ip4_option(pkt, pkt_len,
+							  DHCP_OPTION_REQUESTED_IP,
+							  &wanted))
+				strlcpy(wanted_str, ip4addr_ntoa(&wanted),
+					sizeof(wanted_str));
+			else if (!ip4_addr_isany_val(req->ciaddr))
+				strlcpy(wanted_str, ip4addr_ntoa(&req->ciaddr),
+					sizeof(wanted_str));
+			else
+				strlcpy(wanted_str, "n/a", sizeof(wanted_str));
+
+			printf("DHCP: NAK to %pM (wanted %s)\n",
+			       req->chaddr, wanted_str);
 			recovery_dhcp_send_reply(srv, req, DHCP_NAK, NULL);
+		}
 		break;
 	}
 	case DHCP_RELEASE:
@@ -1728,12 +1796,62 @@ static unsigned long recovery_target_size_cap(enum upload_target tgt)
 	return size_cap;
 }
 
+/* Is there an MTD partition (or device) with exactly this name? */
+static bool recovery_mtd_part_exists(const char *name)
+{
+	struct mtd_info *mtd;
+
+	if (!name || !*name)
+		return false;
+
+	mtd = get_mtd_device_nm(name);
+	if (IS_ERR_OR_NULL(mtd))
+		return false;
+
+	put_mtd_device(mtd);
+
+	return true;
+}
+
+/*
+ * Pick the MTD partition that carries the UBI volume.
+ *
+ * A UBI layout version names that partition, but the labels come from the
+ * vendor tree ("ubi", "ubi1.5", "ubi1.0").  The board DT in this tree labels
+ * the 439 MiB UBI partition "system" instead - the same name that
+ * boot_ubi=ubi part system, recovery_ubi_part and the DT's compatible =
+ * "linux,ubi" node all use.  Resolve it in this order:
+ *
+ *   1. recovery_ubi_part from the environment (the board's own truth),
+ *   2. the layout label, when such an MTD partition really is in the DT,
+ *   3. the layout label unchanged (legacy behaviour).
+ *
+ * Getting this wrong is fatal and silent: recovery_resolve_target() returns
+ * -ENODEV, recovery_calc_target_max() then reports 0, and httpd_post_begin()
+ * falls back to RECOVERY_UPLOAD_MAX, so a 32 MiB-and-larger sysupgrade image
+ * is refused before a single byte of it is read.
+ */
 static const char *recovery_ubi_part(enum upload_target tgt)
 {
 	const char *part;
 
-	if (tgt == TARGET_FIRMWARE && current_ubi_layout)
-		return current_ubi_layout->part;
+	if (tgt == TARGET_FIRMWARE && current_ubi_layout) {
+		const char *want = current_ubi_layout->part;
+		const char *env_part = env_get("recovery_ubi_part");
+
+		if (env_part && *env_part) {
+			if (strcmp(env_part, want))
+				printf("ubi: layout %s names MTD '%s'; using '%s'\n",
+				       current_ubi_layout->version, want, env_part);
+			return env_part;
+		}
+
+		if (!recovery_mtd_part_exists(want))
+			printf("ubi: no MTD '%s' in this DT for layout %s\n",
+			       want, current_ubi_layout->version);
+
+		return want;
+	}
 
 	switch (tgt) {
 	case TARGET_UBOOT:
@@ -1748,7 +1866,27 @@ static const char *recovery_ubi_part(enum upload_target tgt)
 	if (!part)
 		part = env_get("recovery_ubi_part");
 
-	return part ?: "ubi";
+	return part ?: "system";
+}
+
+/*
+ * Read the value of "?<key>=<value>".  The recovery page sends at most one
+ * such parameter and never percent-encodes it, so a stray '%' simply fails
+ * the caller's name check instead of needing to be decoded here.
+ */
+static const char *recovery_query_value(const char *uri, const char *key)
+{
+	size_t key_len = strlen(key);
+	const char *query = strchr(uri, '?');
+
+	if (!query)
+		return NULL;
+
+	query++;
+	if (strncmp(query, key, key_len) || query[key_len] != '=')
+		return NULL;
+
+	return query + key_len + 1;
 }
 
 static int recovery_parse_ubi_layout(const char *uri)
@@ -1770,6 +1908,18 @@ static int recovery_parse_ubi_layout(const char *uri)
 			current_ubi_layout = &recovery_ubi_layouts[i];
 			return 0;
 		}
+	}
+
+	/*
+	 * Only one layout exists now, so an unknown version can only come from
+	 * a page cached before the 1.5/1.0 views were dropped.  Falling back to
+	 * the only layout is safe and much better than a rejection the user
+	 * cannot act on.
+	 */
+	if (ARRAY_SIZE(recovery_ubi_layouts) == 1) {
+		printf("httpd: unknown UBI layout '%s'; using %s on '%s'\n", query,
+		       current_ubi_layout->version, current_ubi_layout->part);
+		return 0;
 	}
 
 	return -EINVAL;
@@ -1968,6 +2118,36 @@ static void recovery_release_target(struct recovery_target *target)
 		put_mtd_device(target->mtd);
 
 	target->mtd = NULL;
+}
+
+/*
+ * Resolve the named MTD partition for a TARGET_PARTITION restore.
+ *
+ * The whole specification is the name: the page listed the partition from
+ * /api/storage and sends back exactly that string, so no environment lookup
+ * is involved.  The image may be smaller than the partition - the erase
+ * still covers the whole partition, so a short image leaves the tail erased
+ * rather than silently keeping stale bytes.
+ */
+static int recovery_resolve_partition_target(struct recovery_target *target)
+{
+	struct mtd_info *mtd;
+
+	mtd_probe_devices();
+	mtd = get_mtd_device_nm(current_partition);
+	if (IS_ERR_OR_NULL(mtd))
+		return IS_ERR(mtd) ? PTR_ERR(mtd) : -ENODEV;
+
+	target->backend = RECOVERY_BACKEND_MTD;
+	target->name = current_partition;
+	target->ubi_part = NULL;
+	target->mtd = mtd;
+	target->ofs = 0;
+	target->cur_size = 0;
+	target->limit = (unsigned long long)mtd->size;
+	target->ubi_needs_format = false;
+
+	return 0;
 }
 
 static int recovery_force_ubi_rebuild(struct recovery_target *target)
@@ -2849,8 +3029,12 @@ static unsigned long recovery_calc_target_max(enum upload_target tgt,
 	unsigned long limit = 0;
 	unsigned long long effective_limit;
 
-	if (recovery_resolve_target(tgt, &target))
+	if (tgt == TARGET_PARTITION) {
+		if (recovery_resolve_partition_target(&target))
+			return 0;
+	} else if (recovery_resolve_target(tgt, &target)) {
 		return 0;
+	}
 
 	if (p_ofs)
 		*p_ofs = target.ofs;
@@ -2874,14 +3058,19 @@ static unsigned long recovery_calc_target_max(enum upload_target tgt,
  * anyone took a copy, the unit is unrecoverable.  These endpoints expose the
  * same storage the write path uses, but read-only:
  *
- *   GET /api/storage                     JSON list of partitions/volumes
+ *   GET /api/storage                     JSON list of MTD partitions
  *   GET /api/backup/mtd/<name>           arm a backup, report id + size
- *   GET /api/backup/ubi/<name>           same for a UBI volume
  *   GET /api/download/<id>/<off>/<len>   one segment of the armed backup
+ *
+ * Only whole MTD partitions are listed.  UBI volumes are a logical layer
+ * *inside* the "system" partition, so a raw backup of "system" already
+ * contains every volume; offering both invited the page to pull hundreds of
+ * megabytes twice, and a volume dump is not something `mtd write` can put
+ * back.
  *
  * An MTD backup keeps physical offsets: a bad eraseblock is emitted as 0xff
  * instead of being skipped, so the dump can be written straight back with
- * nandwrite.  A UBI backup is logical bytes, which is what `ubi write` eats.
+ * `mtd write` / nandwrite and is always exactly partition-sized.
  *
  * Downloads are streamed out of NAND through fs_read_custom(), which needs
  * LWIP_HTTPD_DYNAMIC_FILE_READ and LWIP_HTTPD_FILE_EXTENSION.
@@ -2892,33 +3081,21 @@ static int recovery_open_custom_response(struct fs_file *file,
 					 const char *content_type,
 					 const char *body, int body_len);
 
-#define RECOVERY_BACKUP_NAME_LEN	32
 /* One HTTP segment.  Small enough to hold in the TCP window, big enough that
  * a 64 MiB partition does not need thousands of round trips. */
 #define RECOVERY_BACKUP_SEGMENT		(256 * 1024)
-/* Read-ahead window used when the backend is a UBI volume. */
-#define RECOVERY_BACKUP_CACHE		(32 * 1024)
-
-enum recovery_storage_kind {
-	RECOVERY_STORAGE_MTD = 0,
-	RECOVERY_STORAGE_UBI,
-};
 
 struct recovery_backup {
 	bool ready;
 	u32 id;
-	enum recovery_storage_kind kind;
-	char name[RECOVERY_BACKUP_NAME_LEN];
+	char name[RECOVERY_PARTITION_NAME_LEN];
 	unsigned long long size;
 };
 
 struct recovery_download {
-	struct mtd_info *mtd;	/* non-NULL for a raw MTD backup */
+	struct mtd_info *mtd;
 	char header[384];
 	size_t header_len;
-	void *cache;		/* read-ahead window for a UBI backup */
-	size_t cache_offset;
-	size_t cache_size;
 	size_t data_offset;	/* absolute offset inside the backup */
 	size_t data_len;	/* bytes covered by this one request */
 };
@@ -2927,31 +3104,6 @@ static struct recovery_backup recovery_backup;
 static u32 recovery_backup_seq = 1;
 static unsigned int recovery_downloads;
 
-/*
- * Only [A-Za-z0-9_.-] is accepted.  That covers every partition and volume
- * name on this board (vendor, chainloader, ubi1.5, fit, rootfs_data, ...) and
- * makes JSON string escaping unnecessary.
- */
-static bool recovery_storage_name_valid(const char *name)
-{
-	size_t i;
-
-	if (!name || !name[0] || strlen(name) >= RECOVERY_BACKUP_NAME_LEN)
-		return false;
-
-	for (i = 0; name[i]; i++) {
-		char c = name[i];
-
-		if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-		    (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.')
-			continue;
-
-		return false;
-	}
-
-	return true;
-}
-
 static void recovery_backup_disarm(void)
 {
 	recovery_backup.ready = false;
@@ -2959,62 +3111,35 @@ static void recovery_backup_disarm(void)
 	recovery_backup.name[0] = '\0';
 }
 
-static int recovery_backup_arm(enum recovery_storage_kind kind,
-			       const char *name)
+static int recovery_backup_arm(const char *name)
 {
 	unsigned long long size = 0;
 	struct mtd_info *mtd;
-	struct ubi_device *ubi;
-	int i;
 
 	/* Never read flash while an erase/write job owns it. */
 	if (prog_phase > 0 && prog_phase < 3)
 		return -EBUSY;
 
-	if (!recovery_storage_name_valid(name))
+	if (!recovery_partition_name_valid(name))
 		return -EINVAL;
 
-	if (kind == RECOVERY_STORAGE_MTD) {
-		mtd_probe_devices();
-		mtd = get_mtd_device_nm(name);
-		if (IS_ERR_OR_NULL(mtd))
-			return -ENODEV;
-		size = (unsigned long long)mtd->size;
-		put_mtd_device(mtd);
-	} else {
-		if (!IS_ENABLED(CONFIG_CMD_UBI) || !IS_ENABLED(CONFIG_MTD_UBI))
-			return -ENODEV;
-
-		if (recovery_select_ubi(board_detect_ubi_part()))
-			return -ENODEV;
-
-		ubi = ubi_get_device(0);
-		if (!ubi)
-			return -ENODEV;
-
-		for (i = 0; i < ubi->vtbl_slots; i++) {
-			struct ubi_volume *v = ubi->volumes[i];
-
-			if (v && !strcmp(v->name, name)) {
-				size = (unsigned long long)v->used_bytes;
-				break;
-			}
-		}
-		ubi_put_device(ubi);
-	}
+	mtd_probe_devices();
+	mtd = get_mtd_device_nm(name);
+	if (IS_ERR_OR_NULL(mtd))
+		return -ENODEV;
+	size = (unsigned long long)mtd->size;
+	put_mtd_device(mtd);
 
 	if (!size)
 		return -ENODATA;
 
 	recovery_backup_disarm();
-	recovery_backup.kind = kind;
 	recovery_backup.size = size;
 	strlcpy(recovery_backup.name, name, sizeof(recovery_backup.name));
 	recovery_backup.id = ++recovery_backup_seq;
 	recovery_backup.ready = true;
 
-	printf("httpd: backup of %s '%s' armed (%llu bytes)\n",
-	       kind == RECOVERY_STORAGE_MTD ? "partition" : "volume",
+	printf("httpd: backup of partition '%s' armed (%llu bytes)\n",
 	       recovery_backup.name, recovery_backup.size);
 
 	return 0;
@@ -3051,42 +3176,23 @@ static void appendf(struct recovery_strbuf *sb, const char *fmt, ...)
 static void recovery_storage_catalog(struct recovery_strbuf *sb)
 {
 	struct mtd_info *mtd;
-	struct ubi_device *ubi;
 	bool comma = false;
-	int i;
 
 	appendf(sb, "{\"targets\":[");
 
 	if (IS_ENABLED(CONFIG_MTD)) {
 		mtd_probe_devices();
 		mtd_for_each_device(mtd) {
-			if (!recovery_storage_name_valid(mtd->name))
+			if (!recovery_partition_name_valid(mtd->name))
 				continue;
-			appendf(sb, "%s{\"kind\":\"mtd\",\"name\":\"%s\",\"size\":%llu}",
+			/* ofs is the offset of this partition inside its parent
+			 * chip, so the page can answer "where does this write
+			 * to" without a second round trip. */
+			appendf(sb, "%s{\"kind\":\"mtd\",\"name\":\"%s\",\"size\":%llu,\"ofs\":%llu}",
 				comma ? "," : "", mtd->name,
-				(unsigned long long)mtd->size);
+				(unsigned long long)mtd->size,
+				(unsigned long long)mtd->offset);
 			comma = true;
-		}
-	}
-
-	if (IS_ENABLED(CONFIG_CMD_UBI) && IS_ENABLED(CONFIG_MTD_UBI)) {
-		if (!recovery_select_ubi(board_detect_ubi_part())) {
-			ubi = ubi_get_device(0);
-			if (ubi) {
-				for (i = 0; i < ubi->vtbl_slots; i++) {
-					struct ubi_volume *v = ubi->volumes[i];
-
-					if (!v ||
-					    !recovery_storage_name_valid(v->name))
-						continue;
-					appendf(sb,
-						"%s{\"kind\":\"ubi\",\"name\":\"%s\",\"size\":%llu}",
-						comma ? "," : "", v->name,
-						(unsigned long long)v->used_bytes);
-					comma = true;
-				}
-				ubi_put_device(ubi);
-			}
 		}
 	}
 
@@ -3119,32 +3225,25 @@ static int recovery_open_storage_catalog(struct fs_file *file)
 }
 
 /*
- * /api/backup/<kind>/<name> -- arm a backup and hand the browser the id and
+ * /api/backup/mtd/<name> -- arm a backup and hand the browser the id and
  * total size.  The browser then walks /api/download/<id>/<off>/<len>.
  */
 static int recovery_open_backup(struct fs_file *file, const char *spec)
 {
-	enum recovery_storage_kind kind;
 	const char *name;
 	char json[192];
 	int len;
 	int ret;
 
-	if (!strncmp(spec, "mtd/", 4)) {
-		kind = RECOVERY_STORAGE_MTD;
-		name = spec + 4;
-	} else if (!strncmp(spec, "ubi/", 4)) {
-		kind = RECOVERY_STORAGE_UBI;
-		name = spec + 4;
-	} else {
+	if (strncmp(spec, "mtd/", 4))
 		return 0;
-	}
+	name = spec + 4;
 
 	if (recovery_downloads)
 		return recovery_open_custom_response(file, "application/json",
 						     "{\"error\":\"busy\"}", 16);
 
-	ret = recovery_backup_arm(kind, name);
+	ret = recovery_backup_arm(name);
 	if (ret) {
 		len = snprintf(json, sizeof(json),
 			       "{\"error\":\"cannot backup '%s'\",\"code\":%d}",
@@ -3158,9 +3257,8 @@ static int recovery_open_backup(struct fs_file *file, const char *spec)
 	}
 
 	len = snprintf(json, sizeof(json),
-		       "{\"id\":%u,\"kind\":\"%s\",\"name\":\"%s\",\"size\":%llu}",
+		       "{\"id\":%u,\"kind\":\"mtd\",\"name\":\"%s\",\"size\":%llu}",
 		       recovery_backup.id,
-		       kind == RECOVERY_STORAGE_MTD ? "mtd" : "ubi",
 		       recovery_backup.name, recovery_backup.size);
 	if (len < 0)
 		return 0;
@@ -3202,18 +3300,10 @@ static int recovery_open_download(struct fs_file *file, const char *spec)
 	if (!owner)
 		return 0;
 
-	if (recovery_backup.kind == RECOVERY_STORAGE_MTD) {
-		owner->mtd = get_mtd_device_nm(recovery_backup.name);
-		if (IS_ERR_OR_NULL(owner->mtd)) {
-			free(owner);
-			return 0;
-		}
-	} else {
-		owner->cache = malloc_cache_aligned(RECOVERY_BACKUP_CACHE);
-		if (!owner->cache) {
-			free(owner);
-			return 0;
-		}
+	owner->mtd = get_mtd_device_nm(recovery_backup.name);
+	if (IS_ERR_OR_NULL(owner->mtd)) {
+		free(owner);
+		return 0;
 	}
 
 	owner->data_offset = (size_t)offset;
@@ -3230,9 +3320,7 @@ static int recovery_open_download(struct fs_file *file, const char *spec)
 			 length, recovery_backup.name);
 	if (owner->header_len < 0 ||
 	    owner->header_len >= (int)sizeof(owner->header)) {
-		if (owner->mtd)
-			put_mtd_device(owner->mtd);
-		free(owner->cache);
+		put_mtd_device(owner->mtd);
 		free(owner);
 		return 0;
 	}
@@ -3261,7 +3349,6 @@ static void recovery_close_download(struct fs_file *file)
 
 	if (owner->mtd)
 		put_mtd_device(owner->mtd);
-	free(owner->cache);
 	free(owner);
 	file->pextension = NULL;
 
@@ -3269,15 +3356,31 @@ static void recovery_close_download(struct fs_file *file)
 		recovery_downloads--;
 }
 
+/*
+ * Fill the requested slice of the armed partition into @buffer.
+ *
+ * Every failure mode is absorbed rather than propagated.  Returning EOF here
+ * truncates the response body while the header already promised
+ * Content-Length bytes, and a browser reports that as "Failed to fetch" -
+ * a 439 MiB partition is 1756 segments, so one unreadable eraseblock
+ * anywhere used to throw away the whole dump.  Damaged blocks are emitted as
+ * 0xff, exactly like factory bad blocks, which keeps the image full-size and
+ * at the right physical offsets so it can be written straight back.
+ */
 static int recovery_read_download(struct fs_file *file, char *buffer,
 				  int count)
 {
 	struct recovery_download *owner = file->pextension;
-	size_t offset, len, read = 0, src;
-	int ret = 0;
+	struct mtd_info *mtd;
+	size_t offset, len, retlen, src;
+	loff_t erasesize, pos;
+	int ret;
 
-	if (!owner || !buffer || count <= 0)
+	if (!owner || !owner->mtd || !buffer || count <= 0)
 		return FS_READ_EOF;
+
+	mtd = owner->mtd;
+	erasesize = mtd->erasesize;
 
 	offset = (size_t)file->index;
 	if (offset >= (size_t)file->len)
@@ -3293,57 +3396,31 @@ static int recovery_read_download(struct fs_file *file, char *buffer,
 	}
 
 	src = owner->data_offset + (offset - owner->header_len);
-	len = (size_t)count;
+	pos = (loff_t)src;
 
-	if (owner->mtd) {
-		loff_t pos = (loff_t)src;
-		loff_t erasesize = owner->mtd->erasesize;
-		size_t block_left = (size_t)(erasesize - (pos & (erasesize - 1)));
-		size_t retlen = 0;
+	/* Never read across an eraseblock boundary: mtd_read() is only
+	 * guaranteed to stay inside one. */
+	len = min((size_t)count,
+		  (size_t)(erasesize - (pos & (erasesize - 1))));
 
-		len = min(len, block_left);
-
-		ret = mtd_block_isbad(owner->mtd, pos & ~(erasesize - 1));
-		if (ret > 0) {
-			/* Keep the physical offset: a dumping tool expects a
-			 * full-size image, so pad bad blocks with 0xff. */
-			memset(buffer, 0xff, len);
-			read = len;
-			ret = 0;
-		} else if (!ret) {
-			ret = mtd_read(owner->mtd, pos, len, &retlen,
-				       (u_char *)buffer);
-			if (ret == -EUCLEAN)
-				ret = 0;
-			read = retlen;
-		}
+	ret = mtd_block_isbad(mtd, pos & ~(erasesize - 1));
+	if (ret) {
+		if (ret < 0)
+			printf("httpd: bad-block query failed at 0x%zx (ret=%d); padding 0xff\n",
+			       src, ret);
+		memset(buffer, 0xff, len);
 	} else {
-		if (!owner->cache_size ||
-		    src < owner->cache_offset ||
-		    src >= owner->cache_offset + owner->cache_size) {
-			size_t left = owner->data_len -
-				      (offset - owner->header_len);
-
-			owner->cache_offset = src;
-			owner->cache_size = min((size_t)RECOVERY_BACKUP_CACHE,
-						left);
-			ret = ubi_volume_read(recovery_backup.name,
-					      owner->cache, owner->cache_offset,
-					      owner->cache_size);
+		retlen = 0;
+		ret = mtd_read(mtd, pos, len, &retlen, (u_char *)buffer);
+		if (ret && ret != -EUCLEAN) {
+			printf("httpd: read error at 0x%zx (ret=%d); padding %zu bytes with 0xff\n",
+			       src, ret, len);
+			memset(buffer, 0xff, len);
+		} else if (retlen < len) {
+			printf("httpd: short read at 0x%zx (%zu/%zu); padding 0xff\n",
+			       src, retlen, len);
+			memset(buffer + retlen, 0xff, len - retlen);
 		}
-		if (!ret) {
-			len = min(len, owner->cache_offset +
-				      owner->cache_size - src);
-			memcpy(buffer, owner->cache + src -
-			       owner->cache_offset, len);
-			read = len;
-		}
-	}
-
-	if (ret || read != len) {
-		printf("httpd: backup read failed at %zu (ret=%d, %zu/%zu)\n",
-		       src, ret, read, len);
-		return FS_READ_EOF;
 	}
 
 	file->index += len;
@@ -3598,6 +3675,20 @@ err_t httpd_post_begin(void *connection, const char *uri, const char *http_reque
     } else if (!strncmp(uri, "/upload/uboot", 13) &&
                (uri[13] == '\0' || uri[13] == '?')) {
         current_target = TARGET_UBOOT;
+    } else if (!strncmp(uri, "/upload/partition", 17) &&
+               (uri[17] == '\0' || uri[17] == '?')) {
+        const char *name = recovery_query_value(uri, "name");
+
+        if (!recovery_partition_name_valid(name)) {
+            printf("httpd: rejecting partition restore with name '%s'\n",
+                   name ? name : "(none)");
+            prog_phase = -1;
+            strlcpy(response_uri, "/400.html", response_uri_len);
+            return ERR_ARG;
+        }
+
+        current_target = TARGET_PARTITION;
+        strlcpy(current_partition, name, sizeof(current_partition));
     } else if (!strncmp(uri, "/upload", 7) &&
                (uri[7] == '\0' || uri[7] == '?')) {
         current_target = TARGET_FIRMWARE;
@@ -3636,6 +3727,9 @@ err_t httpd_post_begin(void *connection, const char *uri, const char *http_reque
             } else {
                 printf("httpd: content_len %d exceeds allowed max %lu (target limit %lu, ofs 0x%llx)\n",
                        content_len, max, dts_max, (unsigned long long)tmpofs);
+                if (!dts_max)
+                    printf("httpd: target %d did not resolve; check recovery_mtd/recovery_ubi_part\n",
+                           current_target);
             }
 	    strlcpy(response_uri, "/400.html", response_uri_len);
             return ERR_ARG;
@@ -3679,6 +3773,9 @@ err_t httpd_post_begin(void *connection, const char *uri, const char *http_reque
     if (current_target == TARGET_FIRMWARE)
         printf("httpd: accepting %u-byte firmware for UBI %s\n",
                recv_total, current_ubi_layout->version);
+    else if (current_target == TARGET_PARTITION)
+        printf("httpd: accepting %u-byte image for partition '%s'\n",
+               recv_total, current_partition);
     else
         printf("httpd: accepting %u-byte U-Boot image\n", recv_total);
     return ERR_OK;
@@ -3800,11 +3897,22 @@ static int flash_image(struct recovery_status_led_ctrl *status_leds)
 		}
 	}
 
-	ret = recovery_resolve_target(current_target, &target);
-	if (ret) {
-		printf("No flash target found for upload type %d\n", current_target);
-		prog_phase = -1;
-		return ret;
+	if (current_target == TARGET_PARTITION) {
+		ret = recovery_resolve_partition_target(&target);
+		if (ret) {
+			printf("No MTD partition named '%s' (type %d, ret=%d)\n",
+			       current_partition, current_target, ret);
+			prog_phase = -1;
+			return ret;
+		}
+	} else {
+		ret = recovery_resolve_target(current_target, &target);
+		if (ret) {
+			printf("No flash target found for upload type %d\n",
+			       current_target);
+			prog_phase = -1;
+			return ret;
+		}
 	}
 
 	if (current_target == TARGET_FIRMWARE &&
@@ -3948,9 +4056,14 @@ static int flash_image(struct recovery_status_led_ctrl *status_leds)
 		}
 
 		prog_phase = 2;
+		/*
+		 * Read back after writing for the two targets that carry
+		 * boot-critical data: a silently corrupted U-Boot slot or a
+		 * restored partition is worse than a failed write.
+		 */
 		ret = recovery_write_mtd_region(mtd, ofs, target.limit, image,
 						image_size,
-						current_target == TARGET_UBOOT,
+						current_target != TARGET_FIRMWARE,
 						status_leds);
 		if (ret) {
 			printf("mtd_write failed: %d\n", ret);

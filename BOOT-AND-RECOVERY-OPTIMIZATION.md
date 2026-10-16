@@ -2,8 +2,13 @@
 
 对比对象：
 
-- 本项目 `XR1710G-http-uboot`（U-Boot 2026.07 分支，**chainloader 方案**，naoki66 fork of YYH2913）
+- 本项目（U-Boot 2026.07 分支，**chainloader 方案**）
 - `D:\GitData\uboot-an758x`（U-Boot v2026.10，**TF-A BL2/FIP 原生方案**）
+
+> **2026-10-16 更新**：UBI 布局已收敛为**单一 UBI 2.0**（439 MiB `system` 分区）。
+> 下文出现的 `ubi` / `ubi1.5` / `ubi1.0` 与"WebUI 多布局在线切换"均为**历史状态**：
+> 这两个视图在设备树里没有对应分区，选了只会回落到 `system`，已从页面与代码中移除。
+> 固件上传见 `docs/flashing-xr1710g.md` §6。
 
 ---
 
@@ -260,6 +265,84 @@ CPU 侧或未映射的 SPORT，只在 `auto` 或显式 `1g` 时兜底成 fport 1
   改成单路径需要确认 lwIP 在 netif 未完全 up / 广播包场景下的收包行为，风险不低。
 - **`recovery_port` 的默认值与兜底逻辑**：保留现状，只加了可观测性。
   若现场常见"插 1G 口没反应"，优先查 `recovery_port` 是否被设成 `lan1`/`10g`。
+
+### 4.5 启动时链路 flap 的"黑洞窗口"（本轮修复）
+
+**成因（协议层之外的第四个成因，也是"要拔插几次才有 IP"的直接原因）：**
+`airoha_recovery_restart_links()`（airoha_eth.c）在 DHCP/HTTP 就绪**之后**才把
+LAN/10G PHY 断电重来，而且旧实现是**同步死等**：`mdelay(recovery_lan_flap_ms=1500)`
+→ 上电 → `mdelay(recovery_lan_up_ms=2000)` 盲等 settle。这两次 `mdelay` 把恢复
+主循环整个堵住：`net_lwip_rx()` 不跑（不收包、不跑 `sys_check_timeouts`），
+约 3.5 s 内客户端的 DISCOVER/REQUEST 到不了或没人处理；盲等 2 s 也不保证
+自协商真的完成，第一次 DHCP 回复仍可能发进一个还没就绪的数据通路——客户端
+收不到，按退避重试，外观就是"拔插几次才拿到 IP"（PC 记着别网段的旧租约时
+还要多走一轮 NAK→DISCOVER，更容易撞进窗口）。
+
+**修复（`airoha_recovery_flap_service()`，非阻塞状态机）：**
+- `restart_links()` 只做"立即断电 + 登记截止时间"然后返回，主循环不再被堵；
+- 上电由主循环（`airoha_recovery_poll_link()` 每轮调用）在截止时刻执行，
+  GDM4 立即 prime，10G 通路在等待期间持续训练；
+- "settle"从盲等改为**真实链路状态等待**（BMSR/STAT1，50 ms 轮询），
+  `recovery_lan_up_ms` 退化为超时兜底；按端口打印就绪状态。
+- flap 进行中暂停 `airoha_recovery_retry_pending_wakes()`，避免上电时机被抢。
+
+**新日志形态**（现场判断链路就绪时间用）：
+
+```
+airoha: restarting recovery links after network services are ready (down 1500ms, non-blocking)
+airoha: recovery links powered up, waiting for link
+airoha: recovery links up after 60ms (lan up, 10g up, wan n/a)
+```
+
+**可调 env（语义不变）**：`recovery_link_flap=0` 关闭 flap；
+`recovery_lan_flap_ms`（断电时长，默认 1500）、
+`recovery_lan_up_ms`（等 link 的超时，默认 2000）。
+
+**NAK 诊断增强**（`httpd_recovery.c`）：NAK 时打印客户端请求的地址，
+现场可直接区分"PC 记着别网段的旧 IP"和"池耗尽"：
+
+```
+DHCP: NAK to 38:a7:46:37:ee:65 (wanted 192.168.1.2)
+```
+
+### 4.6 非阻塞 flap 带来的回归：flap 期间把帧发进未就绪的 PHY（本轮修复）
+
+**现场现象**：非阻塞 flap 生效（无冻结）后，1G 口反而**彻底拿不到 IP**——
+日志稳定停在 DISCOVER→OFFER 循环，客户端始终不 REQUEST；而
+`recovery links ready, link timeout after 2000ms (lan down, 10g down, wan n/a)`
+说明 flap 结束时链路被读为 down。同一台机器**手动配置 192.168.0.2 可以打开恢复页**，
+即数据面收发双向都是通的。
+
+**根因（回归）**：4.5 的修复把主循环解冻了，但 **`airoha_eth_send()` 在 flap
+进行期间照常发包**。旧实现用 `mdelay()` 冻结主循环，等价于"PHY 就绪前一个帧都不发"；
+解冻后，客户端在掉电窗口内重发的 DISCOVER 会被**立即**回复，而这条 OFFER 被送进
+正在掉电/尚未完成自协商的 PHY，MAC 直接丢弃——客户端收不到，于是无限重发 DISCOVER。
+旧代码只是"把发包推迟到 settle 之后"，所以最终能成；新代码把这个隐含保证删掉了。
+
+**修复**：`airoha_eth_send()` 开头新增
+
+```c
+if (eth->recovery_flap_active)
+    return -EAGAIN;
+```
+
+保留非阻塞主循环（RX/HTTP/lwIP 超时照跑），但**在 flap 完成前抑制以太网发送**，
+把旧代码"PHY 就绪前不发包"的性质显式化。flap 结束后（就绪或超时）立即恢复发送，
+客户端下一次 DISCOVER 就能拿到 OFFER。
+
+**新增诊断**：DISCOVER/REQUEST 日志带入口端口，现场一眼看出客户端从哪个 fport 进来
+（auto 模式只接受 fport 1/4，fport 2 会被端口策略静默丢弃）：
+
+```
+DHCP: DISCOVER from 38:a7:46:37:ee:65 (rx fport 1)
+DHCP: REQUEST from 38:a7:46:37:ee:65 (rx fport 1)
+```
+
+**现场可零刷机验证**：`setenv recovery_link_flap 0` 后重启进恢复模式——
+若 DHCP 立即正常，则确认是 flap（掉电重来）本身导致，而非端口/协议问题。
+
+> 注：现场那版日志版本串是 `gecc838e778f7-dirty`，即用**有未提交改动的源码**编的，
+> 不能保证与本提交一致；复现请先 `git status` 确认干净后重新构建。
 
 ---
 

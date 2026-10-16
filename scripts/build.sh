@@ -1,6 +1,6 @@
 #!/bin/sh
 #
-# Multi-board build helper for the XR1710G / XG2010G http-uboot tree.
+# Multi-board build helper for the XR1710G / XG2010G recovery tree.
 #
 # Builds U-Boot (u-boot.img) for a single board. No FIP/bootloader signing is
 # performed -- the project flashes the unsigned U-Boot payload via the existing

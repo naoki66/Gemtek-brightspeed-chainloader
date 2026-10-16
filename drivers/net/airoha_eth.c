@@ -264,6 +264,7 @@
 #define AIROHA_RECOVERY_SWITCH_DOWN_SETTLE_MS 50
 #define AIROHA_RECOVERY_FDB_MOVE_FLUSH_MS 500
 #define AIROHA_RECOVERY_LINK_POLL_MS 1000
+#define AIROHA_RECOVERY_FLAP_POLL_MS 50
 #define AIROHA_RECOVERY_LINK_RETRY_MS 3000
 #define AIROHA_RECOVERY_PHY_POWER_SETTLE_MS 10
 #define AIROHA_RECOVERY_MDIO_RETRIES 3
@@ -694,6 +695,11 @@ struct airoha_eth {
 	u16 gdm4_link_speed;
 	ulong recovery_last_link_poll_ms;
 	ulong recovery_last_wake_retry_ms;
+	bool recovery_flap_active;
+	ulong recovery_flap_up_at_ms;
+	ulong recovery_flap_up_ms;
+	ulong recovery_flap_last_poll_ms;
+	u8 recovery_flap_mask;
 	ulong gdm4_last_retry_ms;
 	u8 rtl8261_init_mask;
 	bool rtl8261_phy5_pnswap_tx;
@@ -4413,6 +4419,109 @@ static void airoha_recovery_retry_pending_wakes(struct airoha_eth *eth, ulong no
 }
 
 /*
+ * Drive a link flap started by airoha_recovery_restart_links() from the
+ * recovery main loop. Never blocks: the old inline mdelay() sequence froze
+ * the whole loop (no RX polling, no HTTP, no lwIP timeouts) for the down
+ * time plus a blind settle delay, and DHCP exchanges that landed in that
+ * window were answered late or into a datapath that was still auto-
+ * negotiating, which is why a host had to unplug/retry several times.
+ *
+ * Here the links are pulled down immediately (so the host really sees a
+ * media disconnect and restarts DHCP), powered back up exactly when the
+ * down window has elapsed, and readiness is decided by the real link
+ * state (BMSR/STAT1) with recovery_lan_up_ms as the timeout fallback.
+ */
+static void airoha_recovery_flap_service(struct airoha_eth *eth, ulong now)
+{
+	bool lan, phy5, phy8, ready;
+	ulong up_ms;
+	int ret;
+
+	if (!eth->recovery_flap_active)
+		return;
+
+	lan = eth->recovery_flap_mask & BIT(0);
+	phy5 = eth->recovery_flap_mask & BIT(1);
+	phy8 = eth->recovery_flap_mask & BIT(2);
+
+	if (eth->recovery_flap_up_at_ms) {
+		if (now < eth->recovery_flap_up_at_ms)
+			return;
+
+		if (lan)
+			airoha_recovery_lan_phy_set_power(eth, true, false);
+		if (phy5) {
+			ret = airoha_recovery_rtl8261_set_power(eth,
+								RTL8261_PHY5_ADDR,
+								true);
+			if (ret) {
+				printf("airoha: recovery PHY %d power-up failed: %d\n",
+				       RTL8261_PHY5_ADDR, ret);
+			} else {
+				eth->rtl8261_phy5_wake_pending = false;
+			}
+		}
+		if (phy8) {
+			ret = airoha_recovery_rtl8261_set_power(eth,
+								RTL8261_PHY8_ADDR,
+								true);
+			if (ret) {
+				printf("airoha: recovery PHY %d power-up failed: %d\n",
+				       RTL8261_PHY8_ADDR, ret);
+			} else {
+				eth->rtl8261_phy8_wake_pending = false;
+			}
+		}
+		eth->recovery_last_wake_retry_ms = 0;
+		if (phy5) {
+			eth->gdm4_link_up = false;
+			eth->gdm4_copper_link_up = false;
+			eth->gdm4_link_speed = 0;
+			eth->gdm4_last_retry_ms = 0;
+			airoha_gdm4_recovery_prime(eth);
+		}
+
+		eth->recovery_flap_up_at_ms = 0;
+		eth->recovery_flap_up_ms = now;
+		eth->recovery_flap_last_poll_ms = now;
+		printf("airoha: recovery links powered up, waiting for link\n");
+		return;
+	}
+
+	if (now - eth->recovery_flap_last_poll_ms < AIROHA_RECOVERY_FLAP_POLL_MS)
+		return;
+	eth->recovery_flap_last_poll_ms = now;
+
+	/* Keep training the 10G host path while the copper side settles. */
+	if (phy5)
+		airoha_gdm4_ensure_ready(eth);
+
+	ready = true;
+	if (lan && !airoha_recovery_lan_up(eth))
+		ready = false;
+	if (ready && phy5 && !airoha_mdio_link_up(eth, RTL8261_PHY5_ADDR))
+		ready = false;
+	if (ready && phy8 && !airoha_recovery_wan_up(eth))
+		ready = false;
+
+	up_ms = airoha_recovery_env_ulong("recovery_lan_up_ms",
+					   AIROHA_RECOVERY_LAN_UP_SETTLE_MS);
+	if (!ready && now - eth->recovery_flap_up_ms < up_ms)
+		return;
+
+	eth->recovery_flap_active = false;
+	eth->recovery_flap_mask = 0;
+	/* Let the 1s housekeeping poll run its body again right away. */
+	eth->recovery_link_poll_started = false;
+	printf("airoha: recovery links %s after %lums (lan %s, 10g %s, wan %s)\n",
+	       ready ? "up" : "ready, link timeout",
+	       now - eth->recovery_flap_up_ms,
+	       lan ? (airoha_recovery_lan_up(eth) ? "up" : "down") : "n/a",
+	       phy5 ? (airoha_mdio_link_up(eth, RTL8261_PHY5_ADDR) ? "up" : "down") : "n/a",
+	       phy8 ? (airoha_recovery_wan_up(eth) ? "up" : "down") : "n/a");
+}
+
+/*
  * Restart the client-visible links only after lwIP, DHCP and HTTP are ready.
  * A host that stayed connected while U-Boot entered recovery otherwise keeps
  * its old link state and may not start a fresh DHCP transaction.
@@ -4476,7 +4585,6 @@ void airoha_recovery_restart_links(struct udevice *dev)
 	if (!lan_cycle && !phy5_cycle && !phy8_cycle)
 		return;
 
-	printf("airoha: restarting recovery links after network services are ready\n");
 	if (lan_cycle)
 		down_ms = airoha_recovery_env_ulong("recovery_lan_flap_ms",
 						    AIROHA_RECOVERY_LAN_FLAP_MIN_MS);
@@ -4485,45 +4593,25 @@ void airoha_recovery_restart_links(struct udevice *dev)
 							 link_flap_default);
 		down_ms = max(down_ms, link_down_ms);
 	}
-	mdelay(down_ms);
 
 	/*
-	 * Wait for the LAN PHYs to settle after power-up. The caller returns
-	 * straight into the recovery loop, so without this delay the first
-	 * DHCP replies go out while the PHYs are still auto-negotiating and
-	 * never reach the client; the host then has to retry DISCOVER.
+	 * Only pull the links down here. Sleeping out the down time plus a
+	 * blind settle delay inline used to freeze the whole recovery loop
+	 * for ~3.5s (no RX polling, no HTTP, no lwIP timeouts), and the
+	 * first DHCP exchange after that still raced auto-negotiation, so
+	 * the host had to unplug/retry several times before it got an
+	 * address. airoha_recovery_flap_service() powers the links back up
+	 * on time from the main loop and waits for the real link state.
 	 */
-	if (lan_cycle)
-		airoha_recovery_lan_phy_set_power(eth, true, true);
-	if (phy5_cycle) {
-		ret = airoha_recovery_rtl8261_set_power(eth, RTL8261_PHY5_ADDR, true);
-		if (ret) {
-			printf("airoha: recovery PHY %d power-up failed: %d\n",
-			       RTL8261_PHY5_ADDR, ret);
-		} else {
-			eth->rtl8261_phy5_wake_pending = false;
-		}
-	}
-	if (phy8_cycle) {
-		ret = airoha_recovery_rtl8261_set_power(eth, RTL8261_PHY8_ADDR, true);
-		if (ret) {
-			printf("airoha: recovery PHY %d power-up failed: %d\n",
-			       RTL8261_PHY8_ADDR, ret);
-		} else {
-			eth->rtl8261_phy8_wake_pending = false;
-		}
-	}
-	eth->recovery_last_wake_retry_ms = 0;
-
-	if (phy5_cycle) {
-		eth->gdm4_link_up = false;
-		eth->gdm4_copper_link_up = false;
-		eth->gdm4_link_speed = 0;
-		eth->gdm4_last_retry_ms = 0;
-	}
-	eth->recovery_link_poll_started = false;
-	if (phy5_cycle)
-		airoha_gdm4_recovery_prime(eth);
+	eth->recovery_flap_mask = (lan_cycle ? BIT(0) : 0) |
+				  (phy5_cycle ? BIT(1) : 0) |
+				  (phy8_cycle ? BIT(2) : 0);
+	eth->recovery_flap_up_at_ms = get_timer(0) + down_ms;
+	eth->recovery_flap_up_ms = 0;
+	eth->recovery_flap_last_poll_ms = 0;
+	eth->recovery_flap_active = true;
+	printf("airoha: restarting recovery links after network services are ready (down %lums, non-blocking)\n",
+	       down_ms);
 }
 
 /*
@@ -4539,13 +4627,26 @@ void airoha_recovery_poll_link(struct udevice *dev)
 	u16 speed;
 	bool copper_up, host_ready, link_changed;
 
+	/*
+	 * Runs on every loop iteration: the flap has its own 50ms poll
+	 * interval and must not be delayed by the 1s housekeeping rate
+	 * limit below, otherwise the power-up deadline slips.
+	 */
+	airoha_recovery_flap_service(eth, now);
+
 	if (eth->recovery_link_poll_started &&
 	    now - eth->recovery_last_link_poll_ms <
 		    AIROHA_RECOVERY_LINK_POLL_MS)
 		return;
 	eth->recovery_link_poll_started = true;
 	eth->recovery_last_link_poll_ms = now;
-	airoha_recovery_retry_pending_wakes(eth, now);
+	/*
+	 * While a flap is in progress the power-up timing belongs to
+	 * airoha_recovery_flap_service(); the retry helper would otherwise
+	 * wake the links before the down window has elapsed.
+	 */
+	if (!eth->recovery_flap_active)
+		airoha_recovery_retry_pending_wakes(eth, now);
 
 	if (!airoha_recovery_accept_gdm4_rx())
 		return;
@@ -5976,6 +6077,22 @@ static int airoha_eth_send(struct udevice *dev, void *packet, int length)
 	int first_err = -EAGAIN;
 	u8 fport;
 	int ret;
+
+	/*
+	 * Drop egress while a link flap is running. airoha_recovery_restart_links()
+	 * pulls the recovery PHYs down and airoha_recovery_flap_service() brings
+	 * them back up from the main loop; until the flap finishes the affected
+	 * PHYs are powered down or still auto-negotiating, so a frame handed to
+	 * the MAC now is silently dropped - it never reaches the host. The old
+	 * (blocking) flap guaranteed this implicitly, because the whole loop -
+	 * RX, HTTP and every DHCP reply - was frozen for the down window plus the
+	 * settle delay; making the flap non-blocking removed that protection, so
+	 * the first DHCP OFFER after power-up was pushed into a dead port and the
+	 * host never saw it. Keep the non-blocking loop but hold egress until the
+	 * links are ready again; the host simply retries its DISCOVER.
+	 */
+	if (eth->recovery_flap_active)
+		return -EAGAIN;
 
 	if (!dual_service || length < ARP_HLEN)
 		return airoha_eth_send_on_fport(dev, packet, length,

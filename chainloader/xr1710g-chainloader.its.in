@@ -22,8 +22,15 @@
 			arch = "arm64";
 			os = "linux";
 			compression = "__KCOMP__";
-			load = <0x80088000>;
-			entry = <0x80088000>;
+			/* 0x80000000..0x801fffff is reserved for ATF on XR1710G
+			 * (see the /memreserve/ in the board DTS).  The Image
+			 * text offset is 0x88000, so place its 2 MiB aligned
+			 * base at 0x80200000.  Loading below that is rejected
+			 * by LMB ("Unable to allocate memory ... for loading
+			 * OS") and would overwrite BL31.
+			 */
+			load = <0x80288000>;
+			entry = <0x80288000>;
 			hash@1 {
 				algo = "sha1";
 			};

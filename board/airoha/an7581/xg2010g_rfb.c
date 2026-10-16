@@ -13,6 +13,7 @@
 #include <fdt_support.h>
 #include <mtd.h>
 #include <net-common.h>
+#include <timestamp.h>
 #include <ubi_uboot.h>
 #undef crc32
 #include <u-boot/crc.h>
@@ -786,8 +787,9 @@ int board_late_init(void)
 	ulong recovery_addr;
 	bool uenv_triggered = false;
 
-	printf("XG2010G release %s - %s\n",
-	       XG2010G_RELEASE_VERSION, XG2010G_RELEASE_CREDIT);
+	printf("XG2010G release %s (%s - %s %s) - %s\n",
+	       XG2010G_RELEASE_VERSION, U_BOOT_DATE, U_BOOT_TIME,
+	       U_BOOT_TZ, XG2010G_RELEASE_CREDIT);
 	printf("XG2010G HTTP recovery: type 'http_recovery', then open http://192.168.0.1/ (PC 192.168.0.2/24)\n");
 
 	/* Read only the chainloader-private mtd1/uenv flag; never save mtd0 env. */
