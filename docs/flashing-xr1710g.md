@@ -99,6 +99,14 @@ flash write 0x600000 0x100000 0x81800000
 reset
 ```
 
+> **⚠️ 上面这几条命令只能在`原厂 U-Boot`（提示符 `ECNT>`）下执行。**
+> `uenv` 分区是原厂 U-Boot 的 env 分区，二级 chainloader U-Boot 只是共用读取它。
+> 在 chainloader 里执行 `saveenv` 会把原厂 env 整套覆盖掉，导致原厂 U-Boot 之后无法启动
+> chainloader（表现为卡在 `ECNT>` 并报 `Unknown command 'ubi'`）。详见 FAQ。
+> **⚠️ Run these only at the *vendor* U-Boot prompt (`ECNT>`).** `uenv` is the vendor
+> environment partition; running `saveenv` from the chainloader overwrites it and strands the
+> vendor bootloader. See the FAQ.
+
 执行后原厂 U-Boot 会从偏移 `0x600000` 读取 1 MiB chainloader 并启动。
 *The stock U-Boot now reads the 1 MiB chainloader from offset `0x600000` and boots it.*
 
@@ -153,27 +161,37 @@ reset
   `loadaddr`, i.e. itself — and that address lies inside the ATF reservation
   0x80000000-0x80200000, which LMB rejects.*
 
-  现场修复（U-Boot 命令行，无需重新刷机）*Fix at the U-Boot prompt, no reflash needed:*
-
-  ```sh
-  env default -a
-  saveenv
-  reset
-  ```
-
-  或只改启动变量 *or only rewrite the boot variables:*
+  现行 `board/airoha/an7581/xr1710g_rfb.c` 已在启动时自动改写这类旧配方，重新刷入后无需手工处理。
+  临时绕过（**仅内存，不能 saveenv**）：*Current `xr1710g_rfb.c` rewrites such recipes at boot.
+  Temporary workaround at the chainloader prompt — in RAM only, never `saveenv`:*
 
   ```sh
   setenv bootcmd 'run boot_ubi || http_recovery'
-  setenv boot_production 'run ubi_read_production && bootm ${loadaddr}#${bootconf}'
-  setenv ubi_read_production 'ubi read ${loadaddr} fit'
-  setenv loadaddr 0x81800000
-  setenv bootconf config-1
-  saveenv
-  reset
+  boot
   ```
 
-  现行 `board/airoha/an7581/xr1710g_rfb.c` 已内置同样的规范化逻辑（检测到含 `flash` 的旧配方即改写），
-  重新编译刷入后无需手工执行。
-  *`board/airoha/an7581/xr1710g_rfb.c` now performs the same normalization at boot, so a rebuilt
-  image does not need these commands.*
+- **⚠️ 绝对不要在 chainloader（二级）U-Boot 里执行 `saveenv` 或 `env default -a`。**
+  `uenv` 分区是**原厂 U-Boot 的 env 分区**，二级 U-Boot 只是共用读取。一旦 `saveenv`，原厂
+  环境会被整套替换成 chainloader 的环境（`bootcmd=run boot_ubi || http_recovery` 等），
+  原厂 U-Boot 再启动时就找不到自己的启动配方了（见下一条）。
+  *⚠️ Never run `saveenv` / `env default -a` in the second-stage chainloader U-Boot. `uenv` is the
+  vendor U-Boot's environment partition; the chainloader only reads it. `saveenv` replaces the whole
+  vendor environment with ours, leaving the vendor bootloader without a boot recipe.*
+
+- **原厂 U-Boot 停在 `ECNT>`，日志里是 `Unknown command 'ubi'` + `Unknown command 'http_recovery'`：**
+  说明二级 U-Boot 误执行过 `saveenv`，`uenv` 里的原厂 env 已被替换，原厂 U-Boot 读到了
+  chainloader 的 `bootcmd`。在原厂命令行恢复：
+  *The vendor U-Boot stops at `ECNT>` because `saveenv` ran in the chainloader and replaced the
+  vendor env. Restore it from the vendor prompt:*
+
+  ```sh
+  ECNT> setenv bootcmd 'flash read 0x600000 0x100000 0x81800000; bootm 0x81800000'
+  ECNT> saveenv
+  ECNT> reset
+  ```
+
+  若原厂固件支持 `env default -a`，可先执行它以恢复原厂编译进固件的其余默认变量，再设置上面的
+  `bootcmd`。注意此处的 `saveenv` 是**原厂** U-Boot 执行的，是正确的（它是该分区的主人）。
+  *If the vendor firmware provides `env default -a`, run it first to restore its compiled-in defaults,
+  then set the `bootcmd` above. This `saveenv` is issued by the *vendor* U-Boot and is the correct
+  owner of the partition.*

@@ -14,6 +14,8 @@
 #include <mtd.h>
 #include <net-common.h>
 #include <ubi_uboot.h>
+#undef crc32
+#include <u-boot/crc.h>
 #include <xr1710g_version.h>
 #include <linux/bitops.h>
 #include <linux/err.h>
@@ -36,7 +38,28 @@ DECLARE_GLOBAL_DATA_PTR;
 #define XR1710G_REG_GPIO_OE1		0x0078
 
 #define XR1710G_DSD_PART		"dsd"
+/*
+ * The "uenv" partition holds the *vendor* U-Boot environment, which is also
+ * the environment this chainloader starts with.  It is shared read-mostly
+ * storage: entries may be edited in place, but the whole environment must
+ * never be rewritten with saveenv(), or the vendor bootloader (which reads
+ * its bootcmd from here) would be left without a bootable recipe.
+ */
+#define XR1710G_UENV_PART		"uenv"
+#define XR1710G_UENV_SIZE		0x4000
+#define XR1710G_UENV_ERASE_SIZE	0x40000
+#define XR1710G_UENV_DATA_SIZE		(XR1710G_UENV_SIZE - sizeof(u32))
 #define XR1710G_UBI_PART		"system"
+
+/*
+ * Kernel command line for the UBI FIT rootfs.  U-Boot's fdt_chosen() always
+ * prefers the "bootargs" environment variable over the /chosen/bootargs of
+ * the FIT devicetree, so a vendor command line inherited from the shared uenv
+ * environment would be handed to Linux instead of this one.  Keep in sync with
+ * board/airoha/an7581/xr1710g.env.
+ */
+#define XR1710G_BOOTARGS \
+	"console=ttyS0,115200 earlycon ubi.block=0,fit root=/dev/fit0 rootwait rdinit=/sbin/init"
 #define XR1710G_FACTORY_VOL		"factory"
 #define XR1710G_DSD_OFFSET		0x0000
 #define XR1710G_DSD_ENV_SIZE		0x1000
@@ -195,6 +218,152 @@ static int xr1710g_read_dsd_eeprom(u8 *buf)
 		return -EINVAL;
 
 	return 0;
+}
+
+static bool xr1710g_uenv_is_recovery_trigger(const char *entry, size_t len)
+{
+	static const char name[] = "recovery_trigger=";
+
+	return len == sizeof(name) && !memcmp(entry, name, sizeof(name) - 1) &&
+	       entry[sizeof(name) - 1] == '1';
+}
+
+static int xr1710g_uenv_write_block(struct mtd_info *mtd, const u8 *buf)
+{
+	struct erase_info erase = {
+		.mtd = mtd,
+		.addr = 0,
+		.len = XR1710G_UENV_ERASE_SIZE,
+	};
+	size_t offset = 0;
+	int ret;
+
+	ret = mtd_erase(mtd, &erase);
+	if (ret)
+		return ret;
+
+	while (offset < XR1710G_UENV_ERASE_SIZE) {
+		size_t retlen = 0;
+		size_t len = min_t(size_t, mtd->writesize,
+				   XR1710G_UENV_ERASE_SIZE - offset);
+
+		ret = mtd_write(mtd, offset, len, &retlen, buf + offset);
+		if (ret)
+			return ret;
+		if (retlen != len)
+			return -EIO;
+
+		offset += len;
+	}
+
+	return 0;
+}
+
+/*
+ * Consume the chainloader-private one-shot recovery flag from the shared U-Boot
+ * environment.
+ *
+ * The flag is removed with a raw read-modify-write of the environment block so
+ * that every other entry -- in particular the vendor bootcmd that starts this
+ * chainloader -- survives.  env_save() must not be used here: it would replace
+ * the vendor environment with ours and strand the vendor bootloader at its own
+ * prompt with no bootable recipe.
+ */
+static int xr1710g_uenv_consume_recovery_trigger(bool *triggered)
+{
+	struct mtd_info *mtd;
+	u8 *block = NULL, *verify = NULL;
+	u8 *data, *src, *dst, *end;
+	u32 stored_crc, calculated_crc;
+	size_t retlen = 0;
+	int ret = 0;
+
+	*triggered = false;
+	mtd_probe_devices();
+	mtd = get_mtd_device_nm(XR1710G_UENV_PART);
+	if (IS_ERR_OR_NULL(mtd))
+		return IS_ERR(mtd) ? PTR_ERR(mtd) : -ENODEV;
+
+	if (mtd->size < XR1710G_UENV_ERASE_SIZE ||
+	    !mtd->writesize || XR1710G_UENV_ERASE_SIZE % mtd->writesize) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	block = malloc(XR1710G_UENV_ERASE_SIZE);
+	verify = malloc(XR1710G_UENV_SIZE);
+	if (!block || !verify) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	ret = mtd_read(mtd, 0, XR1710G_UENV_ERASE_SIZE, &retlen, block);
+	if ((ret && ret != -EUCLEAN) || retlen != XR1710G_UENV_ERASE_SIZE) {
+		if (!ret)
+			ret = -EIO;
+		goto out;
+	}
+	ret = 0;
+
+	memcpy(&stored_crc, block, sizeof(stored_crc));
+	data = block + sizeof(stored_crc);
+	calculated_crc = crc32(0, data, XR1710G_UENV_DATA_SIZE);
+	if (stored_crc != calculated_crc) {
+		ret = -EBADMSG;
+		goto out;
+	}
+
+	src = data;
+	dst = data;
+	end = data + XR1710G_UENV_DATA_SIZE;
+	while (src < end && *src) {
+		size_t len = strnlen((char *)src, end - src);
+
+		if (src + len == end) {
+			ret = -EINVAL;
+			goto out;
+		}
+
+		if (xr1710g_uenv_is_recovery_trigger((char *)src, len)) {
+			*triggered = true;
+		} else {
+			memmove(dst, src, len + 1);
+			dst += len + 1;
+		}
+
+		src += len + 1;
+	}
+
+	if (!*triggered)
+		goto out;
+
+	memset(dst, 0, end - dst);
+	calculated_crc = crc32(0, data, XR1710G_UENV_DATA_SIZE);
+	memcpy(block, &calculated_crc, sizeof(calculated_crc));
+
+	ret = xr1710g_uenv_write_block(mtd, block);
+	if (ret)
+		goto out;
+
+	retlen = 0;
+	ret = mtd_read(mtd, 0, XR1710G_UENV_SIZE, &retlen, verify);
+	if ((ret && ret != -EUCLEAN) || retlen != XR1710G_UENV_SIZE) {
+		if (!ret)
+			ret = -EIO;
+		goto out;
+	}
+	ret = 0;
+	if (memcmp(verify, block, XR1710G_UENV_SIZE))
+		ret = -EIO;
+
+out:
+	if (ret)
+		*triggered = false;
+	free(block);
+	free(verify);
+	put_mtd_device(mtd);
+
+	return ret;
 }
 
 static int xr1710g_dsd_get_var(const char *buf, size_t len, const char *key,
@@ -652,13 +821,27 @@ int board_late_init(void)
 {
 	char boot_ubi[64];
 	const char *ubi_part;
-	const char *recovery_trigger;
 	const char *bootcmd;
+	const char *bootargs;
 	ulong recovery_addr;
+	bool uenv_triggered = false;
 
 	if (xr1710g_is_compatible())
 		printf("XR1710G release %s - %s\n",
 		       XR1710G_RELEASE_VERSION, XR1710G_RELEASE_CREDIT);
+
+	/*
+	 * Read only the chainloader-private one-shot flag out of the shared
+	 * uenv environment; the vendor bootcmd stored next to it must survive
+	 * so the vendor bootloader can keep starting this chainloader.
+	 */
+	if (xr1710g_is_compatible()) {
+		int trigger_ret = xr1710g_uenv_consume_recovery_trigger(&uenv_triggered);
+
+		if (trigger_ret && trigger_ret != -ENODEV && trigger_ret != -EBADMSG)
+			printf("XR1710G: uenv trigger read failed: %d\n",
+			       trigger_ret);
+	}
 
 	xr1710g_sync_runtime_ethaddrs();
 	ubi_part = xr1710g_detect_ubi_part();
@@ -702,22 +885,29 @@ int board_late_init(void)
 		env_set("fdt_high", NULL);
 		printf("XR1710G: cleared legacy fdt_high override\n");
 	}
+	/*
+	 * Same for the kernel command line: a vendor bootargs inherited from the
+	 * shared uenv environment would point Linux at the stock rootfs.  Only
+	 * replace values that clearly do not target our UBI FIT rootfs, so an
+	 * adapted or user-supplied command line is preserved.
+	 */
+	bootargs = env_get("bootargs");
+	if (!bootargs || !strstr(bootargs, "fit0")) {
+		env_set("bootargs", XR1710G_BOOTARGS);
+		printf("XR1710G: normalized foreign bootargs for the UBI FIT rootfs\n");
+	}
 	if (xr1710g_ubi_layout_available)
 		xr1710g_sync_factory_part(ubi_part);
 
-	recovery_trigger = env_get("recovery_trigger");
-	if (recovery_trigger && recovery_trigger[0]) {
-		/*
-		 * One-shot software recovery trigger, set by the LuCI
-		 * recovery app.  Clear and persist the flag before starting
-		 * the web recovery server so a power-cycle or a recovery
-		 * flash returns the device to normal booting.
-		 */
-		printf("Recovery trigger detected, starting web recovery...\n");
-		env_set("recovery_trigger", NULL);
-		if (env_save())
-			printf("Warning: failed to save environment, recovery "
-			       "will be re-entered on the next boot\n");
+	/*
+	 * Only the chainloader-private one-shot flag or the reset button may
+	 * select HTTP recovery.  The flag was already consumed (and cleared
+	 * from flash) above, before the recovery server is started, so a
+	 * power-cycle or a recovery flash returns the device to normal
+	 * booting.
+	 */
+	if (uenv_triggered) {
+		printf("Factory uenv recovery trigger consumed, starting web recovery...\n");
 	} else if (!xr1710g_recovery_button_pressed()) {
 		return 0;
 	} else {
