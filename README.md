@@ -112,7 +112,15 @@ UBI 备份为逻辑字节，对应 `ubi write` 输入语义。
 | `0x600000` | legacy bootm shim（`chainloader-prefix-shim.uImage`） | `27 05 19 56`（IH_MAGIC） |
 | `0x602100` | chainloader FIT（内嵌 DTB + shim + 二级 U-Boot） | `d0 0d fe ed`（FDT_MAGIC） |
 
-槽位上限 `RECOVERY_MAX_UBOOT_SIZE = 1 MiB`；本机最近产物约 914 KB，余量约 120 KB。
+槽位上限 `RECOVERY_MAX_UBOOT_SIZE = 1 MiB`（`0x100000`）。
+最近一次 CI 产物（`xr1710g-chainloader-20261016-135953-g0d90131373e4-slot.bin`）
+实测 **1,001,522 字节（978 KiB）**，余量 **46 KiB（4.5%）**。
+
+其中约 98% 是 FIT 里以 `compression = "none"` 存放的**二级 U-Boot 本体**
+（`uboot@1`，982,768 字节；`fdt@1` 仅 266 字节、`kernel@1` shim 8,632 字节）。
+把它声明为 `compression = "gzip"` 可把槽位降到约 429 KiB（实测压缩率 43.2%），
+是比扩容分区便宜得多的做法——详见
+[BOOT-AND-RECOVERY-OPTIMIZATION.md](BOOT-AND-RECOVERY-OPTIMIZATION.md) §5 与 §7。
 
 ### 5.3 二级 U-Boot 启动环境变量（`board/airoha/an7581/xr1710g.env`）
 
