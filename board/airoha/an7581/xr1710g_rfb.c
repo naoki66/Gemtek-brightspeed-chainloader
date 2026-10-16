@@ -13,6 +13,7 @@
 #include <fdt_support.h>
 #include <mtd.h>
 #include <net-common.h>
+#include <timestamp.h>
 #include <ubi_uboot.h>
 #undef crc32
 #include <u-boot/crc.h>
@@ -827,8 +828,9 @@ int board_late_init(void)
 	bool uenv_triggered = false;
 
 	if (xr1710g_is_compatible())
-		printf("XR1710G release %s - %s\n",
-		       XR1710G_RELEASE_VERSION, XR1710G_RELEASE_CREDIT);
+		printf("XR1710G release %s (%s - %s %s) - %s\n",
+		       XR1710G_RELEASE_VERSION, U_BOOT_DATE, U_BOOT_TIME,
+		       U_BOOT_TZ, XR1710G_RELEASE_CREDIT);
 
 	/*
 	 * Read only the chainloader-private one-shot flag out of the shared

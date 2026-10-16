@@ -45,7 +45,11 @@ mkdir -p "$OUTPUT_DIR"
 # identify.  XG2010G_BUILD_STAMP can be supplied by CI for reproducibility.
 BUILD_STAMP="${XG2010G_BUILD_STAMP:-$(date +%Y%m%d-%H%M%S)}"
 EXPECTED_COMMIT="$(git -C "$UBOOT_DIR" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
-PAYLOAD_VERSION="$(strings "$PAYLOAD" 2>/dev/null | sed -n 's/.*U-Boot \(XG2010G-recovery-[^ ]*\).*/\1/p' | head -1 || true)"
+# Refuse to package a payload that does not carry this very commit: the banner
+# is the only reliable proof that the binary matches the tree.  The pattern
+# matches any board prefix (XR1710G-..., XG2010G-recovery-...) so both ports
+# are actually checked, instead of silently skipping the guard.
+PAYLOAD_VERSION="$(strings "$PAYLOAD" 2>/dev/null | sed -n 's/.*U-Boot \([^ ]*-g[0-9a-f][0-9a-f]*[^ ]*\).*/\1/p' | head -1 || true)"
 if [ -n "$PAYLOAD_VERSION" ] && [ "$EXPECTED_COMMIT" != "unknown" ] &&
    [[ "$PAYLOAD_VERSION" != *"-g${EXPECTED_COMMIT}"* ]]; then
   echo "Error: payload version '$PAYLOAD_VERSION' does not match HEAD '$EXPECTED_COMMIT'. Rebuild U-Boot before packaging." >&2
@@ -53,13 +57,13 @@ if [ -n "$PAYLOAD_VERSION" ] && [ "$EXPECTED_COMMIT" != "unknown" ] &&
 fi
 COMMIT_ID="${XG2010G_COMMIT_ID:-$EXPECTED_COMMIT}"
 OUTPUT_PREFIX="$BOARD-chainloader-${BUILD_STAMP}-g${COMMIT_ID}"
-OUTPUT_FIT="$OUTPUT_DIR/${OUTPUT_PREFIX}.itb"
 OUTPUT_SLOT="$OUTPUT_DIR/${OUTPUT_PREFIX}-slot.bin"
 OUTPUT_PAYLOAD="$OUTPUT_DIR/${BOARD}-u-boot-${BUILD_STAMP}-g${COMMIT_ID}.bin"
-LATEST_FIT="$OUTPUT_DIR/$BOARD-chainloader.itb"
-# The flashable artifact is published as <board>-chainloader-slot.bin; the bare
-# FIT (<board>-chainloader.itb) is for RAM-only TFTP validation and must never
-# be uploaded through HTTP Recovery.
+# The chainloader slot is the only artifact this script delivers, and its name
+# carries the build stamp plus the short commit so two builds can never be
+# confused.  The bare FIT is assembled in a temporary directory as an
+# intermediate only: it is deliberately not emitted, because a bare .itb must
+# never be uploaded through HTTP Recovery.
 LATEST_SLOT="$OUTPUT_DIR/$BOARD-chainloader-slot.bin"
 MAX_SLOT_SIZE=$((0x100000))
 
@@ -67,6 +71,7 @@ TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT
 
 ITS="$TMPDIR/$BOARD-chainloader.its"
+FIT="$TMPDIR/$BOARD-chainloader.itb"
 
 sed \
   -e "s|__DTB__|$DTB|g" \
@@ -75,20 +80,19 @@ sed \
   -e "s|__KCOMP__|none|g" \
   "$TEMPLATE" > "$ITS"
 
-echo "Building FIT image..."
-"$MKIMAGE" -f "$ITS" "$OUTPUT_FIT"
-"$DUMPIMAGE" -l "$OUTPUT_FIT"
+echo "Building FIT image (intermediate)..."
+"$MKIMAGE" -f "$ITS" "$FIT"
+"$DUMPIMAGE" -l "$FIT"
 
 echo "Building slot image..."
 prefix_size=$(wc -c < "$PREFIX_SHIM")
 cp "$PREFIX_SHIM" "$OUTPUT_SLOT"
 dd if=/dev/zero bs=1 count=$((0x2100 - prefix_size)) >> "$OUTPUT_SLOT" 2>/dev/null
-cat "$OUTPUT_FIT" >> "$OUTPUT_SLOT"
+cat "$FIT" >> "$OUTPUT_SLOT"
 
-# Stable aliases are retained for existing tooling; the timestamped files
-# above are the canonical artifacts to archive or flash.
+# The stable alias is kept for the flashing guide, which refers to the
+# unversioned name; the timestamped slot above is the artifact to publish.
 cp "$PAYLOAD" "$OUTPUT_PAYLOAD"
-cp "$OUTPUT_FIT" "$LATEST_FIT"
 cp "$OUTPUT_SLOT" "$LATEST_SLOT"
 
 slot_size=$(wc -c < "$OUTPUT_SLOT")
@@ -98,10 +102,9 @@ if [ "$slot_size" -ge "$MAX_SLOT_SIZE" ]; then
 fi
 echo ""
 echo "Done!"
-echo "  FIT:  $OUTPUT_FIT ($(wc -c < "$OUTPUT_FIT") bytes)"
 echo "  Slot: $OUTPUT_SLOT ($slot_size bytes; maximum $((MAX_SLOT_SIZE - 1)) bytes)"
 echo "  U-Boot payload: $OUTPUT_PAYLOAD ($(wc -c < "$OUTPUT_PAYLOAD") bytes)"
-echo "  Latest aliases: $LATEST_FIT, $LATEST_SLOT"
+echo "  Stable alias: $LATEST_SLOT"
 echo ""
 echo "Magic check:"
 echo "  Offset 0x0000: $(dd if="$OUTPUT_SLOT" bs=1 count=4 2>/dev/null | od -A n -t x1 | tr -d ' \n')"

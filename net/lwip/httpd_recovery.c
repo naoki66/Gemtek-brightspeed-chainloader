@@ -65,7 +65,7 @@ DECLARE_GLOBAL_DATA_PTR;
 #if defined(CONFIG_BOARD_XG2010G)
 #define BOARD_RELEASE_VERSION        XG2010G_RELEASE_VERSION
 #define BOARD_RELEASE_CREDIT         XG2010G_RELEASE_CREDIT
-#define BOARD_FLASH_SLOT_NAME        "xg2010g-chainloader-slot.bin"
+#define BOARD_FLASH_SLOT_NAME        "xg2010g-chainloader-*-slot.bin"
 int xg2010g_sync_factory(void);
 int xg2010g_sync_factory_part(const char *part);
 const char *xg2010g_detect_ubi_version(void);
@@ -77,7 +77,7 @@ const char *xg2010g_detect_ubi_part(void);
 #else
 #define BOARD_RELEASE_VERSION        XR1710G_RELEASE_VERSION
 #define BOARD_RELEASE_CREDIT         XR1710G_RELEASE_CREDIT
-#define BOARD_FLASH_SLOT_NAME        "xr1710g-chainloader-slot.bin"
+#define BOARD_FLASH_SLOT_NAME        "xr1710g-chainloader-*-slot.bin"
 int xr1710g_sync_factory(void);
 int xr1710g_sync_factory_part(const char *part);
 const char *xr1710g_detect_ubi_version(void);

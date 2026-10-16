@@ -7,7 +7,7 @@
 | | |
 |---|---|
 | 适用机型 / Boards | XR1710G / W1700K / W1701K |
-| 刷入文件 / File to flash | `xr1710g-chainloader-slot.bin`（唯一需要刷入的文件 / the only file to flash） |
+| 刷入文件 / File to flash | `xr1710g-chainloader-<版本>-slot.bin`（唯一需要刷入的文件 / the only file to flash） |
 | 下载 / Download | [Releases](https://github.com/naoki66/Gemtek-brightspeed-chainloader/releases) |
 | 参考项目 / Reference | [Gemtek-brightspeed-chainloader](https://github.com/naoki66/Gemtek-brightspeed-chainloader) |
 
@@ -29,8 +29,16 @@
   *PC + serial terminal (115200 8N1)*
 - TFTP 服务器软件（Windows 用 TFTPD64，Linux/macOS 用 `tftp`）
   *TFTP server software*
-- 固件文件 `xr1710g-chainloader-slot.bin`（放在 TFTP 服务器当前目录）
-  *Place `xr1710g-chainloader-slot.bin` in the TFTP server directory*
+- 固件文件 `xr1710g-chainloader-<版本>-slot.bin`（放在 TFTP 服务器当前目录）
+  *Place `xr1710g-chainloader-<version>-slot.bin` in the TFTP server directory*
+
+> Release 页面每个机型只有一个文件，文件名内嵌版本号与构建时间，例如
+> `xr1710g-chainloader-20261016-040544-gc1a49ffc4d63-slot.bin`。下文命令为简洁一律写作
+> `xr1710g-chainloader-slot.bin`：请把下载到的文件**重命名**成该名，或把命令里的文件名换成实际下载的文件名。
+> *Each board has exactly one file on the Releases page, and its name carries the version and
+> build time, e.g. `xr1710g-chainloader-20261016-040544-gc1a49ffc4d63-slot.bin`. The commands below
+> use the short `xr1710g-chainloader-slot.bin` for brevity: rename the downloaded file, or
+> substitute the real filename in the commands.*
 
 ## 2. TTL 连接 / TTL connection
 
@@ -126,15 +134,19 @@ reset
    *DHCP (192.168.0.2–192.168.0.50) also works; see the FAQ if the client never gets an address.*
 4. 上传 OpenWrt 固件 `*-sysupgrade.itb`（选择 `firmware` 目标），等待写入完成。
    *Upload the OpenWrt `*-sysupgrade.itb` (target `firmware`) and wait.*
-5. 日常升级都走 HTTP 恢复，无需再拆机 TTL；更新 chainloader 本身用 `uboot` 目标上传 `xr1710g-chainloader-slot.bin`。
+5. 日常升级都走 HTTP 恢复，无需再拆机 TTL；更新 chainloader 本身用 `uboot` 目标上传 `xr1710g-chainloader-<版本>-slot.bin`。
    *Later upgrades all go through HTTP recovery — no more TTL. Update the chainloader itself via the `uboot` target.*
 
-## 4. 两种固件文件 / The two firmware files
+## 4. 固件文件 / The firmware file
 
 | 文件 / File | 用途 / Purpose |
 |---|---|
-| `xr1710g-chainloader-slot.bin` | 唯一用于刷机的镜像：通过 HTTP Recovery 的 `uboot` 目标写入 chainloader 分区（偏移 0x600000，1 MiB）。The only image to flash: write through the HTTP Recovery `uboot` target. |
-| `xr1710g-chainloader.itb` | 仅用于 TFTP RAM 验证启动（`tftpboot` + `bootm`），**请勿**通过 HTTP Recovery 上传。RAM-only validation through TFTP. Do **not** upload to HTTP Recovery. |
+| `xr1710g-chainloader-<版本>-slot.bin` | 唯一用于刷机的镜像：通过 HTTP Recovery 的 `uboot` 目标写入 chainloader 分区（偏移 0x600000，1 MiB）。The only image to flash: write through the HTTP Recovery `uboot` target. |
+
+> 构建过程只产出这一个文件。**不再提供** `.itb`：裸 FIT 不能通过 HTTP Recovery 上传，
+> 没有理由发布一个不该被使用的文件。
+> *The build produces this one file only. A bare `.itb` is no longer shipped: it must never be
+> uploaded to HTTP Recovery, so there is no reason to publish a file that must not be used.*
 
 > 不要刷 `u-boot.bin` / `u-boot.img`。Never flash `u-boot.bin` / `u-boot.img`.
 
@@ -152,8 +164,10 @@ reset
   *Missed the interrupt window — power-cycle and press earlier.*
 - **TFTP 超时**：检查电脑 IP（192.168.0.10）、TFTP 服务器已启动、文件名无误、网线插在 10GbE 口。
   *Check the PC IP, TFTP server status, filename and cable.*
-- **`Wrong Image Format`**：镜像文件不对，确认使用的是 `xr1710g-chainloader-slot.bin`。
-  *Wrong image file — use `xr1710g-chainloader-slot.bin`.*
+- **`Wrong Image Format`**：镜像文件不对，确认使用的是 `xr1710g-chainloader-*-slot.bin`
+  （文件名带版本号与构建时间），而不是 `u-boot.bin` 或裸 `.itb`。
+  *Wrong image file — use `xr1710g-chainloader-*-slot.bin` (the name carries the version and build
+  time), not `u-boot.bin` or a bare `.itb`.*
 - **恢复页面打不开**：确认按住 reset 上电、电脑为 DHCP、访问 <http://192.168.0.1>。
   *Make sure recovery was entered, the PC uses DHCP, and the URL is http://192.168.0.1.*
 - **串口停在 `Unknown command 'flash'`，接着 `Unable to allocate memory 0x80088000`：**

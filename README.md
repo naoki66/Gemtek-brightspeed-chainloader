@@ -8,16 +8,20 @@ Both boards share the same scheme: keep the stock first 6 MiB (`bootloader` / `u
 
 | 机型 / Board | 教程 / Guide | 刷入文件 / File to flash |
 |---|---|---|
-| XR1710G (W1700K / W1701K) | [docs/flashing-xr1710g.md](docs/flashing-xr1710g.md) | `xr1710g-chainloader-slot.bin` |
-| XG2010G | [docs/flashing-xg2010g.md](docs/flashing-xg2010g.md) | `xg2010g-chainloader-slot.bin` |
+| XR1710G (W1700K / W1701K) | [docs/flashing-xr1710g.md](docs/flashing-xr1710g.md) | `xr1710g-chainloader-*-slot.bin` |
+| XG2010G | [docs/flashing-xg2010g.md](docs/flashing-xg2010g.md) | `xg2010g-chainloader-*-slot.bin` |
 
 ### 发布文件说明 / Release artifacts
 
+每个机型只发布 **1 个文件**：chainloader 槽位镜像。
+*Each board ships exactly one file: the chainloader slot image.*
 
 | 文件 / File | 用途 / Purpose |
 |---|---|
-| `<board>-chainloader-slot.bin` | 唯一用于刷机的镜像：通过 HTTP Recovery 的 `uboot` 目标写入 chainloader 分区（偏移 0x600000，1 MiB）。The only image to flash: write through the HTTP Recovery `uboot` target. |
-| `<board>-chainloader.itb` | 仅用于 TFTP RAM 验证启动，请勿通过 HTTP Recovery 上传。RAM-only validation through TFTP. Do not upload this file to HTTP Recovery. |
+| `<board>-chainloader-<版本>-slot.bin`<br>例 / e.g. `xr1710g-chainloader-20261016-040544-gc1a49ffc4d63-slot.bin` | 唯一用于刷机的镜像：通过 HTTP Recovery 的 `uboot` 目标写入 chainloader 分区（偏移 0x600000，1 MiB）。The only image to flash: write through the HTTP Recovery `uboot` target. |
+
+文件名内嵌**版本号与构建时间**，可直接区分不同构建；刷机时文件名随意，校验只看镜像头部 magic。
+*The filename carries the version and the build time so builds are easy to tell apart; the filename itself is not validated — only the image magic is.*
 
 
 ### 日常升级 / Upgrades after install
@@ -27,7 +31,7 @@ Both boards share the same scheme: keep the stock first 6 MiB (`bootloader` / `u
 3. 选择上传目标并上传文件：
    *Pick a target and upload:*
    - `firmware`：OpenWrt `*-sysupgrade.itb`，写入 `system:fit`。
-   - `uboot`：`<board>-chainloader-slot.bin`，写入原始 chainloader 分区。
+   - `uboot`：`<board>-chainloader-<版本>-slot.bin`，写入原始 chainloader 分区。
 4. `firmware` 上传仅支持单一 `system` UBI 布局（大小 `0x1B700000`，528-PEB 预留尾区），镜像必须匹配该布局。
    *`firmware` uploads only support the single `system` UBI layout (`0x1B700000`, 528-PEB reserved tail); the image must match.*
 
