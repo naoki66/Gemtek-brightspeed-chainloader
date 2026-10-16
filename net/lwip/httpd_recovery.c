@@ -38,6 +38,7 @@
 #include <lwip/apps/fs.h>
 #include <lwip/prot/dhcp.h>
 #include <lwip/prot/iana.h>
+#include <lwip/prot/ethernet.h>
 #include <version.h>
 #if defined(CONFIG_BOARD_XG2010G)
 #include <xg2010g_version.h>
@@ -1230,6 +1231,54 @@ static void recovery_dhcp_log_filtered(struct recovery_dhcp_server *srv)
 	       airoha_recovery_last_rx_fport(srv->netif->state));
 }
 
+/*
+ * Deliver a reply straight to the client's hardware address.
+ *
+ * The recovery LAN port does not reliably deliver the broadcast replies we
+ * send on the normal path: a host plugged into fport 1 keeps retransmitting
+ * DISCOVER while the server keeps OFFERing, and the same host reaches the
+ * recovery page as soon as it is given a static address - i.e. plain L2
+ * unicast works while our broadcast does not. Sending the reply a second
+ * time addressed to the client's own MAC therefore rides the path that is
+ * known to work.
+ *
+ * A temporary static ARP entry lets lwIP emit that unicast frame without
+ * waiting for an ARP reply, which an unconfigured DHCP client cannot send.
+ */
+static void recovery_dhcp_send_unicast(struct recovery_dhcp_server *srv,
+				       const struct dhcp_msg *req,
+				       struct pbuf *reply,
+				       const ip4_addr_t *addr)
+{
+	struct eth_addr ethaddr;
+	ip_addr_t dst_addr;
+	ip_addr_t src_addr;
+	struct pbuf *copy;
+	err_t err;
+
+	if (!addr || ip4_addr_isany_val(*addr) || !req->hlen ||
+	    req->hlen > sizeof(ethaddr.addr))
+		return;
+
+	memcpy(ethaddr.addr, req->chaddr, sizeof(ethaddr.addr));
+	etharp_remove_static_entry(addr);
+	if (etharp_add_static_entry(addr, &ethaddr) != ERR_OK)
+		return;
+
+	copy = pbuf_alloc(PBUF_TRANSPORT, reply->tot_len, PBUF_RAM);
+	if (copy && pbuf_copy(copy, reply) == ERR_OK) {
+		ip_addr_copy_from_ip4(dst_addr, *addr);
+		ip_addr_copy_from_ip4(src_addr, srv->server_ip);
+		err = udp_sendto_if_src(srv->pcb, copy, &dst_addr,
+					LWIP_IANA_PORT_DHCP_CLIENT, srv->netif,
+					&src_addr);
+		if (err != ERR_OK)
+			printf("DHCP: unicast reply failed, err=%d\n", err);
+	}
+	pbuf_free(copy);
+	etharp_remove_static_entry(addr);
+}
+
 static int recovery_dhcp_send_reply(struct recovery_dhcp_server *srv,
 				    const struct dhcp_msg *req,
 				    u8 message_type,
@@ -1312,6 +1361,16 @@ static int recovery_dhcp_send_reply(struct recovery_dhcp_server *srv,
 	err = udp_sendto_if_src(srv->pcb, p, &reply_addr,
 				LWIP_IANA_PORT_DHCP_CLIENT, srv->netif,
 				&src_addr);
+
+	/*
+	 * The broadcast above is what a client that asked for broadcast needs,
+	 * but it is not reliably delivered to a host on a recovery LAN port on
+	 * this board. Follow it with a unicast copy to the client's own MAC,
+	 * which is the path a static address proves works.
+	 */
+	if (assign_address)
+		recovery_dhcp_send_unicast(srv, req, p, yiaddr);
+
 	pbuf_free(p);
 
 	if (err == ERR_OK) {

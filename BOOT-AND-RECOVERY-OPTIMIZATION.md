@@ -344,6 +344,36 @@ DHCP: REQUEST from 38:a7:46:37:ee:65 (rx fport 1)
 > 注：现场那版日志版本串是 `gecc838e778f7-dirty`，即用**有未提交改动的源码**编的，
 > 不能保证与本提交一致；复现请先 `git status` 确认干净后重新构建。
 
+### 4.7 真机复查：广播回复送不到，改为按客户端 MAC 单播补发（本轮修复）
+
+§4.6 的"flap 期间抑制发送"是必要的，但**不足以解决**现场问题。上机后 `g76494d4…` 日志显示：
+
+```
+airoha: restarting recovery links after network services are ready (down 1500ms, non-blocking)
+airoha: recovery links powered up, waiting for link
+airoha: recovery links ready, link timeout after 2000ms (lan down, 10g down, wan n/a)
+DHCP: DISCOVER from 38:a7:46:37:ee:65 (rx fport 1)
+DHCP: sent OFFER to 38:a7:46:37:ee:65 (offered 192.168.0.2)
+...（循环）
+```
+
+**关键推断**：DISCOVER 已带入口端口 `rx fport 1`，说明客户端确实插在 1G 口、服务器也接受并回复了；
+而 Windows 一直停在"正在识别"。若客户端**收到过** OFFER，它必然要么发 REQUEST（会打印
+`DHCP: REQUEST from`）、要么发 DHCPDECLINE（会打印 `unknown msg type 4`）——日志里两者都没有
+⇒ **客户端根本没收到 OFFER**。结合"手动配 192.168.0.2 能开恢复页"（那是普通 L2 **单播**），
+结论是：**本机 CPU→1G 口的广播路径不能把回复送达主机，而单播路径是好的。**
+
+**修复**（`net/lwip/httpd_recovery.c`）：保留原广播发送（满足要求广播的客户端），**再补发一份
+L2 单播**——目标为客户端自己的 MAC：
+- 临时用 `etharp_add_static_entry(yiaddr → req->chaddr)` 建立静态 ARP，
+  让 lwIP 直接生成"IP 目的 = 分配地址、L2 目的 = 客户端 MAC"的单播帧，
+  不必等未配置 IP 的客户端回 ARP；
+- `udp_sendto_if_src()` 发出后立即 `etharp_remove_static_entry()` 复原；
+- 仅在有分配地址（OFFER/带地址的 ACK）时补发，NAK/INFORM 仍只广播。
+
+单播帧会走 `airoha_pick_packet_tx_fport()` → 学到的 peer fport（= 1）→ `send_on_fport(…,1)`，
+正是与静态地址可访问相同的、已被证明可用的路径。
+
 ---
 
 ## 5. 体积与验证状态
