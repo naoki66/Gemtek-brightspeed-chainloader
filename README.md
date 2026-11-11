@@ -217,6 +217,7 @@ recovery_size_uboot=0x100000
 
 - [docs/flashing-xr1710g.md](docs/flashing-xr1710g.md) — XR1710G（W1700K / W1701K）TTL 刷机教程
 - [docs/flashing-xg2010g.md](docs/flashing-xg2010g.md) — XG2010G 刷机教程
+- [docs/ssh-flash-chainloader.md](docs/ssh-flash-chainloader.md) — 通过 SSH 在线刷写 chainloader（XR1710G / XG2010G，无需 TTL）
 - [BOOT-AND-RECOVERY-OPTIMIZATION.md](BOOT-AND-RECOVERY-OPTIMIZATION.md) —
   引导链路 / 启动速度 / 恢复与备份 / DHCP 与端口策略 / 网口数据通路（两个 USXGMII PCS）/
   槽位体积与扩容评估 / 版本号与发布约定 / 容易复发的坑 / 待办 / 真机验证判据
