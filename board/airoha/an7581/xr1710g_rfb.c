@@ -85,8 +85,11 @@ static const struct xr1710g_ubi_layout *xr1710g_active_ubi_layout =
 static bool xr1710g_ubi_layout_probed;
 static bool xr1710g_ubi_layout_available;
 
-static const char *const xr1710g_fdt_lan_mac_paths[] = {
+static const char *const xr1710g_fdt_cpu_mac_paths[] = {
 	"/soc/ethernet@1fb50000/ethernet@1",
+};
+
+static const char *const xr1710g_fdt_lan_mac_paths[] = {
 	"/soc/ethernet@1fb50000/ethernet@4",
 };
 
@@ -760,7 +763,7 @@ static int xr1710g_fdt_set_mac(void *blob, const char *path, const u8 *mac)
 
 static void xr1710g_fixup_fdt_macs(void *blob)
 {
-	u8 lan_mac[ARP_HLEN], wan_mac[ARP_HLEN];
+	u8 lan_mac[ARP_HLEN], wan_mac[ARP_HLEN], cpu_mac[ARP_HLEN];
 	int i, ret;
 
 	if (!xr1710g_is_compatible())
@@ -768,6 +771,17 @@ static void xr1710g_fixup_fdt_macs(void *blob)
 
 	if (xr1710g_get_runtime_ethaddrs(lan_mac, wan_mac))
 		return;
+
+	/* Keep the CPU/conduit port off the LAN and Wi-Fi derived offsets. */
+	xr1710g_mac_add(lan_mac, 4, cpu_mac);
+
+	for (i = 0; i < ARRAY_SIZE(xr1710g_fdt_cpu_mac_paths); i++) {
+		ret = xr1710g_fdt_set_mac(blob, xr1710g_fdt_cpu_mac_paths[i],
+					  cpu_mac);
+		if (ret && ret != -FDT_ERR_NOTFOUND)
+			printf("XR1710G: failed to update MAC for %s: %d\n",
+			       xr1710g_fdt_cpu_mac_paths[i], ret);
+	}
 
 	for (i = 0; i < ARRAY_SIZE(xr1710g_fdt_lan_mac_paths); i++) {
 		ret = xr1710g_fdt_set_mac(blob, xr1710g_fdt_lan_mac_paths[i],
