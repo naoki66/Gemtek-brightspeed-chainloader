@@ -1488,14 +1488,18 @@ static void recovery_dhcp_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
 
 			if (!recovery_dhcp_get_ip4_option(pkt, pkt_len,
 							  DHCP_OPTION_REQUESTED_IP,
-							  &wanted))
+							  &wanted)) {
 				strlcpy(wanted_str, ip4addr_ntoa(&wanted),
 					sizeof(wanted_str));
-			else if (!ip4_addr_isany_val(req->ciaddr))
-				strlcpy(wanted_str, ip4addr_ntoa(&req->ciaddr),
+			} else if (!ip4_addr_isany_val(req->ciaddr)) {
+				ip4_addr_t ciaddr;
+
+				ip4_addr_copy(ciaddr, req->ciaddr);
+				strlcpy(wanted_str, ip4addr_ntoa(&ciaddr),
 					sizeof(wanted_str));
-			else
+			} else {
 				strlcpy(wanted_str, "n/a", sizeof(wanted_str));
+			}
 
 			printf("DHCP: NAK to %pM (wanted %s)\n",
 			       req->chaddr, wanted_str);
