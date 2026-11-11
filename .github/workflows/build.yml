@@ -43,7 +43,7 @@ jobs:
   # make the release title depend on which job finished last.
   stamp:
     name: Resolve build stamp
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       stamp: ${{ steps.now.outputs.stamp }}
       release_date: ${{ steps.now.outputs.release_date }}
@@ -63,7 +63,7 @@ jobs:
 
   build:
     name: Build ${{ matrix.target }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: stamp
     strategy:
       fail-fast: false
@@ -226,7 +226,7 @@ jobs:
     name: Publish GitHub Release
     needs: build
     if: ${{ github.event_name == 'workflow_dispatch' && needs.build.outputs.build_mode != 'test' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
 
