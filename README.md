@@ -164,7 +164,14 @@ recovery_size_uboot=0x100000
 ## 6. 常见问题（FAQ）
 
 - **打断超时，看到 `T T T...`**：打断窗口错过，重新上电并提前按键。
-- **TFTP 超时**：检查 PC IP（192.168.0.10）、TFTP 服务器已启动、文件名无误、网线插在 10GbE 口。
+- **TFTP 超时**：先检查 PC IP（192.168.0.10）、TFTP 服务、文件名和 10GbE 网线连接。
+  若下载持续出现 类似`T #T T T #T T #T #T T` 并/或报 `Retry count exceeded; starting again`，可考虑原厂定时器配置异常。在实测的 XR1710G原厂UBoot中，定时器曾以 10 毫秒周期重载回绕，现象与回绕导致 TFTP 误判超时一致。
+  可于 `tftpboot` 前尝试以下临时修正：
+  ```sh
+  mw.l 0x1fbf010c 0xffffbc70 1
+  tftpboot 0x81800000 xr1710g-chainloader-slot.bin
+  ```
+  该命令写入**内存映射的定时器硬件寄存器**，仅改变当前运行状态，不会擦写 Flash或修改已保存的环境变量；重启后会重新初始化。
 - **`Wrong Image Format`**：镜像不对。确认使用的是 `xr1710g-chainloader-*-slot.bin`
   （文件名带版本号与构建时间），不要刷 `u-boot.bin` / `u-boot.img` 或裸 `.itb`。
 - **恢复页面打不开**：确认按住 reset 上电进入恢复、PC 用 DHCP 或静态 `192.168.0.10`、
